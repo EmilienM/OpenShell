@@ -4,6 +4,7 @@
 //! Persistence layer for `OpenShell` Server.
 
 mod legacy_time_wire;
+pub mod mutation_lock;
 mod postgres;
 mod sqlite;
 
@@ -17,6 +18,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub use mutation_lock::{LockMode, MutationLockKey, MutationLockSet};
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
@@ -58,6 +60,10 @@ pub enum PersistenceError {
     Conflict {
         current_resource_version: Option<u64>,
     },
+    /// The mutation lock was not acquired before its deadline, so this
+    /// request's guarded writes did not run; the operation is safe to retry.
+    #[error("mutation lock timeout: {0}")]
+    LockTimeout(String),
 }
 
 impl PersistenceError {
@@ -285,15 +291,22 @@ impl Store {
     /// Serialize mutations whose invariants span multiple persisted objects.
     ///
     /// `SQLite` deployments are single-replica and use only the caller's local
-    /// mutex. `PostgreSQL` deployments additionally hold a session-level
-    /// advisory lock so concurrent gateway replicas cannot validate and write
-    /// the same cross-object invariant independently.
+    /// locks. `PostgreSQL` deployments additionally hold `locks` as
+    /// session-level advisory locks, taken in ascending key order on one
+    /// connection from the dedicated lock pool, so concurrent gateway replicas
+    /// cannot validate and write the same cross-object invariant
+    /// independently. Fails with [`PersistenceError::LockTimeout`] when the
+    /// locks are not acquired by `deadline`, and with
+    /// [`PersistenceError::Database`] when `PostgreSQL` does not open a lock
+    /// connection in at least [`mutation_lock::LOCK_CONNECTION_MIN_BUDGET`].
     pub async fn acquire_distributed_mutation_guard(
         &self,
+        locks: &MutationLockSet,
+        deadline: tokio::time::Instant,
     ) -> PersistenceResult<DistributedMutationGuard> {
         match self {
             Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_cross_object_lock().await?),
+                _postgres: Some(store.acquire_mutation_locks(locks, deadline).await?),
             }),
             Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
         }
