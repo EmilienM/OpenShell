@@ -208,6 +208,21 @@ pub struct DistributedMutationGuard {
     _postgres: Option<postgres::PostgresAdvisoryLockGuard>,
 }
 
+#[cfg(test)]
+impl DistributedMutationGuard {
+    /// Backend process id of the `PostgreSQL` session holding the locks, or
+    /// `None` on `SQLite`.
+    pub(crate) async fn postgres_backend_pid(&mut self) -> Option<i32> {
+        let Self {
+            _postgres: postgres,
+        } = self;
+        match postgres {
+            Some(guard) => Some(guard.backend_pid().await),
+            None => None,
+        }
+    }
+}
+
 /// Trait for inferring an object type string from a message type.
 pub trait ObjectType {
     fn object_type() -> &'static str;
@@ -1395,6 +1410,12 @@ pub async fn test_store() -> Store {
         .await
         .expect("in-memory SQLite store should connect")
 }
+
+#[cfg(test)]
+pub mod test_postgres;
+
+#[cfg(test)]
+mod mutation_lock_pg_tests;
 
 #[cfg(test)]
 mod tests;
