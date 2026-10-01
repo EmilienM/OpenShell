@@ -168,29 +168,45 @@ Relays:
 | `openshell_server_relay_expired_total` | Counter | None | Pending relays dropped because the supervisor did not connect back within 10 seconds. |
 | `openshell_server_relay_claim_duration_seconds` | Histogram | None | Time from opening a relay to the supervisor claiming it. |
 
-Peer requests, which this replica sends to the replica that owns a sandbox's
-supervisor session:
+Routed requests include local relay setup and outbound requests to the replica
+that owns a sandbox's supervisor session:
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `openshell_server_peer_requests_total` | Counter | `method`, `outcome`, `grpc_code` | Requests sent to the owning replica. Each retry counts separately. |
+| `openshell_server_routed_request_attempts_total` | Counter | `operation`, `route`, `target`, `outcome`, `grpc_code` | Local relay setup and outbound peer attempts, counted once at completion or cancellation. Each retry counts separately. |
 | `openshell_server_peer_request_duration_seconds` | Histogram | `method`, `outcome` | Latency of those requests. For `PeerRelay`, until the owner's supervisor claimed the relay. |
 
 The labels take these values:
 
-- `reason` is `global_capacity` or `sandbox_capacity`.
+- `operation` is `relay`, `report_provider_readiness`, `report_endpoint_status`,
+  or `get_sandbox_provider_status`. Only relay setup includes the local route;
+  the other operations count outbound peer calls, not local API handling.
+- `target` is `ssh` or `tcp` for relays, and `none` for other operations. An
+  omitted relay target counts as `ssh`, matching the protocol's compatibility
+  behavior. TCP hostnames and ports are not labels.
+- `route` is `local` when this replica tries its own supervisor session, or
+  `peer` when it tries another replica. A routed retry counts again, including a
+  change from local to peer routing. Waiting for an owner does not count. Incoming
+  `PeerRelay` requests do not increment this counter on the receiving replica;
+  they appear in that replica's gRPC request counter instead. This counter does
+  not measure active connections, unique client requests, or unfinished attempts.
+- `reason` is `replica_capacity` when the gateway replica's pending-relay budget
+  is full, or `sandbox_capacity` when one sandbox's budget on that replica is full.
 - `method` is `PeerRelay`, `PeerReportProviderReadiness`,
   `PeerReportEndpointStatus`, or `PeerGetSandboxProviderStatus`, the same
   values as the `method` label of `openshell_server_grpc_requests_total` on
   the owning replica.
-- `outcome` is `success`, `client_error`, or `rpc_error`. `client_error` means the
-  request failed before it reached the owner (token, connection, or stream
-  setup), or the caller cancelled it at any point, which records
+- `outcome` is `success`, `client_error`, or `rpc_error`. Local relay success
+  means the open was enqueued to the supervisor; peer relay success means the
+  supervisor claimed it and the peer returned response headers. Neither measures
+  the lifetime of the data stream. `client_error` means local relay setup failed,
+  or a peer request failed before it reached the owner (token, connection, or
+  stream setup), or the caller cancelled it at any point, which records
   `grpc_code="cancelled"` even when the owner was already handling the request.
   `rpc_error` means the call to the owner failed, either with the owner's gRPC
   status or with a transport error on an already open peer connection.
 - `grpc_code` is the lowercase gRPC status name, such as `ok`, `unavailable`,
-  or `resource_exhausted`, as the owner returned it. For `PeerRelay`, the
+  or `resource_exhausted`, from local setup or the peer RPC. For `PeerRelay`, the
   gateway then reports a failure to the client as `UNAVAILABLE`. The other
   RPCs return the owner's status to the client unchanged. The label is not
   named `code` because `openshell_server_grpc_requests_total` uses that name
@@ -199,10 +215,11 @@ The labels take these values:
 Gauges and counters exist from startup. They start at `0`, except
 `openshell_server_relay_pending_capacity` and
 `openshell_server_relay_pending_per_sandbox_capacity`, which start at their
-limits. `openshell_server_peer_requests_total` starts with only its
-`outcome="success"` series. Other outcomes and codes, and every histogram, appear
-after their first sample, so write alert expressions that tolerate absent
-series.
+limits. `openshell_server_routed_request_attempts_total` starts with seven
+`outcome="success", grpc_code="ok"` series: four relay target/route combinations
+and three other peer operations with `target="none"`. Other outcomes and codes,
+and every histogram, appear after their first sample, so write alert expressions
+that tolerate absent series.
 
 ## Request and Readiness Metrics
 
