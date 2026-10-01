@@ -202,8 +202,8 @@ configuration, and access control.
 | Sessions per replica | `openshell_server_supervisor_sessions` | Placement and skew. Do not scale on it. |
 | Relay utilization | `openshell_server_relay_pending`, `openshell_server_relay_pending_capacity` | Graph it. It is transient and usually near 0, so alert on rejections instead. |
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
-| Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds count only as expired, so alert on any increase. |
-| Routed requests | `openshell_server_routed_request_attempts_total`, `openshell_server_peer_request_duration_seconds` | Local/peer relay setup mix and outbound peer rate, failures, and latency. Counts completed or cancelled attempts, including retries. Do not use as an HPA target. |
+| Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds are missing from the histogram and count as expired, so alert on any increase. |
+| Routed requests | `openshell_server_routed_request_attempts_total`, `openshell_server_peer_request_duration_seconds` | Local/peer relay setup mix and outbound peer rate, failures, and latency. Counts completed or cancelled attempts, including retries. Spikes of `grpc_code="unavailable"` during rollouts are expected. Do not use as an HPA target. |
 
 These queries assume that Prometheus labels each series with `namespace` and
 `pod`:
@@ -219,8 +219,8 @@ sum by (namespace, pod, reason) (increase(openshell_server_relay_rejected_total[
 # 99th percentile time for supervisors to claim a relay on each replica.
 histogram_quantile(0.99, sum by (namespace, pod, le) (rate(openshell_server_relay_claim_duration_seconds_bucket[5m])))
 
-# Completed or cancelled relay setup attempts, by replica, target, and route.
-sum by (namespace, pod, target, route) (rate(openshell_server_routed_request_attempts_total{operation="relay"}[5m]))
+# Completed or cancelled relay setup attempts, by replica, relay kind, and route.
+sum by (namespace, pod, relay_kind, route) (rate(openshell_server_routed_request_attempts_total{operation="relay"}[5m]))
 
 # Session skew across replicas. 1 means balanced. Starting and stopping pods
 # raise it during rollouts.
@@ -232,14 +232,14 @@ sum by (operation) (rate(openshell_server_routed_request_attempts_total{route="p
   / sum by (operation) (rate(openshell_server_routed_request_attempts_total{route="peer"}[5m]))
 
 # 99th percentile peer request latency across the fleet.
-histogram_quantile(0.99, sum by (le, method) (rate(openshell_server_peer_request_duration_seconds_bucket{outcome="success"}[5m])))
+histogram_quantile(0.99, sum by (le, operation) (rate(openshell_server_peer_request_duration_seconds_bucket{outcome="success"}[5m])))
 ```
 
 Relay capacity is used on the replica that owns the sandbox's supervisor
 session, including relays that other replicas request through peers, so
 adding replicas does not relieve a busy owner. A relay whose client gave up
 stays counted for up to about 40 seconds, the 10-second claim timeout plus the
-30-second cleanup interval. Peer request counts include retries during
+30-second cleanup interval. Routed request counts include retries during
 rollouts.
 
 ## Scale the Gateway

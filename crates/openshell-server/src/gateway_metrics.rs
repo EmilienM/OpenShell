@@ -25,8 +25,6 @@ use tonic::{Code, Status};
 pub const SUPERVISOR_SESSIONS: &str = "openshell_server_supervisor_sessions";
 pub const RELAY_PENDING: &str = "openshell_server_relay_pending";
 pub const RELAY_PENDING_CAPACITY: &str = "openshell_server_relay_pending_capacity";
-pub const RELAY_PENDING_PER_SANDBOX_CAPACITY: &str =
-    "openshell_server_relay_pending_per_sandbox_capacity";
 // Counters
 pub const RELAY_REJECTED_TOTAL: &str = "openshell_server_relay_rejected_total";
 pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
@@ -36,11 +34,10 @@ pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_dur
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
 
 const LABEL_REASON: &str = "reason";
-const LABEL_METHOD: &str = "method";
 const LABEL_OPERATION: &str = "operation";
 const LABEL_OUTCOME: &str = "outcome";
 const LABEL_GRPC_CODE: &str = "grpc_code";
-const LABEL_TARGET: &str = "target";
+const LABEL_RELAY_KIND: &str = "relay_kind";
 const LABEL_ROUTE: &str = "route";
 
 /// Buckets for the new latency histograms, 1 ms to 15 s. The top buckets cover the 10 s relay
@@ -56,12 +53,12 @@ const BUCKETED_HISTOGRAMS: [&str; 2] =
 
 /// Protocol the supervisor is asked to relay. Never label metrics with the target address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RelayTarget {
+pub enum RelayKind {
     Ssh,
     Tcp,
 }
 
-impl RelayTarget {
+impl RelayKind {
     pub const ALL: [Self; 2] = [Self::Ssh, Self::Tcp];
 
     pub const fn label(self) -> &'static str {
@@ -108,8 +105,8 @@ impl RelayRejection {
     }
 }
 
-/// Outbound peer RPC. The `method` label takes the same values as the `method` label of
-/// `openshell_server_grpc_requests_total` on the owning replica.
+/// Routed operation. For a peer request, the owning replica records the matching gRPC method in
+/// `openshell_server_grpc_requests_total`, for example `PeerRelay` for `relay`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerRpc {
     Relay,
@@ -126,15 +123,6 @@ impl PeerRpc {
         Self::GetSandboxProviderStatus,
     ];
 
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Relay => "PeerRelay",
-            Self::ReportProviderReadiness => "PeerReportProviderReadiness",
-            Self::ReportEndpointStatus => "PeerReportEndpointStatus",
-            Self::GetSandboxProviderStatus => "PeerGetSandboxProviderStatus",
-        }
-    }
-
     const fn operation(self) -> &'static str {
         match self {
             Self::Relay => "relay",
@@ -145,19 +133,23 @@ impl PeerRpc {
     }
 }
 
+/// Where a routed attempt ended. A relay succeeds only when the supervisor claims it, on either
+/// route, so the values mean the same thing for local and peer attempts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PeerOutcome {
+enum AttemptOutcome {
     Success,
-    ClientError,
-    RpcError,
+    /// Failed on this replica, including cancellation by the caller.
+    LocalError,
+    /// The owning replica returned an error, or the open peer connection failed.
+    RemoteError,
 }
 
-impl PeerOutcome {
+impl AttemptOutcome {
     const fn label(self) -> &'static str {
         match self {
             Self::Success => "success",
-            Self::ClientError => "client_error",
-            Self::RpcError => "rpc_error",
+            Self::LocalError => "local_error",
+            Self::RemoteError => "remote_error",
         }
     }
 }
@@ -187,15 +179,12 @@ const fn grpc_code_label(code: Code) -> &'static str {
     }
 }
 
-/// Relay caps published as `openshell_server_relay_pending_capacity` and
-/// `openshell_server_relay_pending_per_sandbox_capacity`. The caller passes the values that
-/// enforce the caps, so this module does not depend on the relay registry.
+/// Relay cap published as `openshell_server_relay_pending_capacity`. The caller passes the value
+/// that enforces the cap, so this module does not depend on the relay registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RelayCapacity {
     /// Pending relays allowed on one replica.
-    pub global: usize,
-    /// Pending relays allowed for one sandbox on one replica.
-    pub per_sandbox: usize,
+    pub per_replica: usize,
 }
 
 /// Apply the bucket overrides. Tests build local recorders from the same builder.
@@ -236,11 +225,6 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
         Unit::Count,
         "Maximum pending relay channels on one gateway replica."
     );
-    describe_gauge!(
-        RELAY_PENDING_PER_SANDBOX_CAPACITY,
-        Unit::Count,
-        "Maximum pending relay channels for one sandbox on one gateway replica."
-    );
     describe_counter!(
         ROUTED_REQUEST_ATTEMPTS_TOTAL,
         Unit::Count,
@@ -264,22 +248,21 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
     describe_histogram!(
         PEER_REQUEST_DURATION_SECONDS,
         Unit::Seconds,
-        "Latency of requests to the owning replica. For PeerRelay, until the owner's supervisor claimed the relay."
+        "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
     );
 
     // `increment(0)` registers a series without overwriting a value recorded earlier.
     gauge!(SUPERVISOR_SESSIONS).increment(0.0);
     gauge!(RELAY_PENDING).increment(0.0);
-    gauge!(RELAY_PENDING_CAPACITY).set(count_as_f64(relay.global));
-    gauge!(RELAY_PENDING_PER_SANDBOX_CAPACITY).set(count_as_f64(relay.per_sandbox));
-    for target in RelayTarget::ALL {
+    gauge!(RELAY_PENDING_CAPACITY).set(count_as_f64(relay.per_replica));
+    for kind in RelayKind::ALL {
         for route in RelayRoute::ALL {
             counter!(
                 ROUTED_REQUEST_ATTEMPTS_TOTAL,
                 LABEL_OPERATION => PeerRpc::Relay.operation(),
                 LABEL_ROUTE => route.label(),
-                LABEL_TARGET => target.label(),
-                LABEL_OUTCOME => PeerOutcome::Success.label(),
+                LABEL_RELAY_KIND => kind.label(),
+                LABEL_OUTCOME => AttemptOutcome::Success.label(),
                 LABEL_GRPC_CODE => grpc_code_label(Code::Ok)
             )
             .increment(0);
@@ -297,8 +280,8 @@ pub fn describe_and_initialize(relay: RelayCapacity) {
             ROUTED_REQUEST_ATTEMPTS_TOTAL,
             LABEL_OPERATION => rpc.operation(),
             LABEL_ROUTE => RelayRoute::Peer.label(),
-            LABEL_TARGET => "none",
-            LABEL_OUTCOME => PeerOutcome::Success.label(),
+            LABEL_RELAY_KIND => "none",
+            LABEL_OUTCOME => AttemptOutcome::Success.label(),
             LABEL_GRPC_CODE => grpc_code_label(Code::Ok)
         )
         .increment(0);
@@ -357,14 +340,13 @@ pub fn record_relay_claimed(waited: Duration) {
 }
 
 /// Counts one local relay setup or outbound peer attempt exactly once, and times peer requests.
-/// Local success means enqueued; peer relay success means the supervisor claimed it.
-/// Dropping an unfinished timer (the caller's future was cancelled) records
-/// `client_error` / `cancelled`.
-#[must_use = "finish the timer with client_error() or finish()"]
+/// A relay succeeds when the supervisor claims it, on either route. Dropping an unfinished
+/// timer (the caller gave up) records `local_error` / `cancelled`.
+#[must_use = "finish the timer with local_error() or finish()"]
 pub struct RoutedRequestTimer {
     rpc: PeerRpc,
     route: RelayRoute,
-    target: Option<RelayTarget>,
+    relay_kind: Option<RelayKind>,
     started: Instant,
     recorded: bool,
 }
@@ -374,8 +356,8 @@ impl RoutedRequestTimer {
         Self {
             rpc,
             route: RelayRoute::Peer,
-            target: if rpc == PeerRpc::Relay {
-                Some(RelayTarget::Ssh)
+            relay_kind: if rpc == PeerRpc::Relay {
+                Some(RelayKind::Ssh)
             } else {
                 None
             },
@@ -384,32 +366,34 @@ impl RoutedRequestTimer {
         }
     }
 
-    pub fn relay(target: RelayTarget, route: RelayRoute) -> Self {
+    pub fn relay(kind: RelayKind, route: RelayRoute) -> Self {
         Self {
             rpc: PeerRpc::Relay,
             route,
-            target: Some(target),
+            relay_kind: Some(kind),
             started: Instant::now(),
             recorded: false,
         }
     }
 
-    /// The request failed before it reached the peer: token, channel, headers, or stream setup.
-    pub fn client_error(&mut self, status: &Status) {
-        self.record(PeerOutcome::ClientError, status.code());
+    /// The attempt failed on this replica: local relay setup or claim (including the claim
+    /// window closing), or a peer request that failed before it reached the owner (token,
+    /// channel, headers, or stream setup).
+    pub fn local_error(&mut self, status: &Status) {
+        self.record(AttemptOutcome::LocalError, status.code());
     }
 
     /// Record the raw tonic result of the RPC itself. Call this BEFORE any remap to
     /// `Unavailable`, so the owner's code (for example `resource_exhausted`) is kept.
     pub fn finish<T>(&mut self, result: &Result<T, Status>) {
         match result {
-            Ok(_) => self.record(PeerOutcome::Success, Code::Ok),
-            Err(status) if self.route == RelayRoute::Local => self.client_error(status),
-            Err(status) => self.record(PeerOutcome::RpcError, status.code()),
+            Ok(_) => self.record(AttemptOutcome::Success, Code::Ok),
+            Err(status) if self.route == RelayRoute::Local => self.local_error(status),
+            Err(status) => self.record(AttemptOutcome::RemoteError, status.code()),
         }
     }
 
-    fn record(&mut self, outcome: PeerOutcome, code: Code) {
+    fn record(&mut self, outcome: AttemptOutcome, code: Code) {
         if self.recorded {
             return;
         }
@@ -418,7 +402,7 @@ impl RoutedRequestTimer {
             ROUTED_REQUEST_ATTEMPTS_TOTAL,
             LABEL_OPERATION => self.rpc.operation(),
             LABEL_ROUTE => self.route.label(),
-            LABEL_TARGET => self.target.map_or("none", RelayTarget::label),
+            LABEL_RELAY_KIND => self.relay_kind.map_or("none", RelayKind::label),
             LABEL_OUTCOME => outcome.label(),
             LABEL_GRPC_CODE => grpc_code_label(code)
         )
@@ -426,7 +410,7 @@ impl RoutedRequestTimer {
         if self.route == RelayRoute::Peer {
             histogram!(
                 PEER_REQUEST_DURATION_SECONDS,
-                LABEL_METHOD => self.rpc.label(),
+                LABEL_OPERATION => self.rpc.operation(),
                 LABEL_OUTCOME => outcome.label()
             )
             .record(self.started.elapsed());
@@ -436,7 +420,7 @@ impl RoutedRequestTimer {
 
 impl Drop for RoutedRequestTimer {
     fn drop(&mut self) {
-        self.record(PeerOutcome::ClientError, Code::Cancelled);
+        self.record(AttemptOutcome::LocalError, Code::Cancelled);
     }
 }
 
@@ -504,14 +488,10 @@ mod tests {
     #[test]
     fn describe_and_initialize_exports_capacity_and_zero_series() {
         let metrics = MetricsCapture::install();
-        describe_and_initialize(RelayCapacity {
-            global: 256,
-            per_sandbox: 32,
-        });
+        describe_and_initialize(RelayCapacity { per_replica: 256 });
 
         for (series, expected) in [
             ("openshell_server_relay_pending_capacity", 256),
-            ("openshell_server_relay_pending_per_sandbox_capacity", 32),
             ("openshell_server_supervisor_sessions", 0),
             ("openshell_server_relay_pending", 0),
             (
@@ -526,10 +506,10 @@ mod tests {
         ] {
             assert_eq!(metrics.value(series), Some(expected), "{series}");
         }
-        for target in ["ssh", "tcp"] {
+        for kind in ["ssh", "tcp"] {
             for route in ["local", "peer"] {
                 let series = format!(
-                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"{route}\",target=\"{target}\",outcome=\"success\",grpc_code=\"ok\"}}"
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"{route}\",relay_kind=\"{kind}\",outcome=\"success\",grpc_code=\"ok\"}}"
                 );
                 assert_eq!(metrics.value(&series), Some(0), "{series}");
             }
@@ -540,7 +520,7 @@ mod tests {
             "get_sandbox_provider_status",
         ] {
             let series = format!(
-                "openshell_server_routed_request_attempts_total{{operation=\"{operation}\",route=\"peer\",target=\"none\",outcome=\"success\",grpc_code=\"ok\"}}"
+                "openshell_server_routed_request_attempts_total{{operation=\"{operation}\",route=\"peer\",relay_kind=\"none\",outcome=\"success\",grpc_code=\"ok\"}}"
             );
             assert_eq!(metrics.value(&series), Some(0), "{series}");
         }
@@ -554,23 +534,20 @@ mod tests {
     #[test]
     fn routed_attempts_have_seven_bounded_success_series_and_keep_counts_on_initialize() {
         let metrics = MetricsCapture::install();
-        for target in RelayTarget::ALL {
+        for kind in RelayKind::ALL {
             for route in RelayRoute::ALL {
-                RoutedRequestTimer::relay(target, route).finish(&Ok::<(), Status>(()));
+                RoutedRequestTimer::relay(kind, route).finish(&Ok::<(), Status>(()));
             }
         }
-        RoutedRequestTimer::relay(RelayTarget::Tcp, RelayRoute::Peer).finish(&Ok::<(), Status>(()));
-        describe_and_initialize(RelayCapacity {
-            global: 256,
-            per_sandbox: 32,
-        });
+        RoutedRequestTimer::relay(RelayKind::Tcp, RelayRoute::Peer).finish(&Ok::<(), Status>(()));
+        describe_and_initialize(RelayCapacity { per_replica: 256 });
 
-        for target in ["ssh", "tcp"] {
+        for kind in ["ssh", "tcp"] {
             for route in ["local", "peer"] {
                 let series = format!(
-                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"{route}\",target=\"{target}\",outcome=\"success\",grpc_code=\"ok\"}}"
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"{route}\",relay_kind=\"{kind}\",outcome=\"success\",grpc_code=\"ok\"}}"
                 );
-                let expected = if target == "tcp" && route == "peer" {
+                let expected = if kind == "tcp" && route == "peer" {
                     2
                 } else {
                     1
@@ -598,7 +575,7 @@ mod tests {
         histogram!(RELAY_CLAIM_DURATION_SECONDS).record(sample);
         histogram!(
             PEER_REQUEST_DURATION_SECONDS,
-            LABEL_METHOD => "PeerRelay",
+            LABEL_OPERATION => "relay",
             LABEL_OUTCOME => "success"
         )
         .record(sample);
@@ -682,23 +659,23 @@ mod tests {
         drop(relay);
         assert_eq!(
             metrics.value(
-                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",target=\"ssh\",outcome=\"rpc_error\",grpc_code=\"resource_exhausted\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",relay_kind=\"ssh\",outcome=\"remote_error\",grpc_code=\"resource_exhausted\"}"
             ),
             Some(1)
         );
         assert_eq!(
             metrics.value(
-                "openshell_server_peer_request_duration_seconds_count{method=\"PeerRelay\",outcome=\"rpc_error\"}"
+                "openshell_server_peer_request_duration_seconds_count{operation=\"relay\",outcome=\"remote_error\"}"
             ),
             Some(1)
         );
 
         let mut endpoint = RoutedRequestTimer::start(PeerRpc::ReportEndpointStatus);
-        endpoint.client_error(&Status::unavailable("x"));
+        endpoint.local_error(&Status::unavailable("x"));
         drop(endpoint);
         assert_eq!(
             metrics.value(
-                "openshell_server_routed_request_attempts_total{operation=\"report_endpoint_status\",route=\"peer\",target=\"none\",outcome=\"client_error\",grpc_code=\"unavailable\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"report_endpoint_status\",route=\"peer\",relay_kind=\"none\",outcome=\"local_error\",grpc_code=\"unavailable\"}"
             ),
             Some(1)
         );
@@ -708,7 +685,7 @@ mod tests {
         drop(provider_status);
         assert_eq!(
             metrics.value(
-                "openshell_server_routed_request_attempts_total{operation=\"get_sandbox_provider_status\",route=\"peer\",target=\"none\",outcome=\"success\",grpc_code=\"ok\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"get_sandbox_provider_status\",route=\"peer\",relay_kind=\"none\",outcome=\"success\",grpc_code=\"ok\"}"
             ),
             Some(1)
         );
@@ -720,7 +697,7 @@ mod tests {
         drop(RoutedRequestTimer::start(PeerRpc::ReportProviderReadiness));
         assert_eq!(
             metrics.value(
-                "openshell_server_routed_request_attempts_total{operation=\"report_provider_readiness\",route=\"peer\",target=\"none\",outcome=\"client_error\",grpc_code=\"cancelled\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"report_provider_readiness\",route=\"peer\",relay_kind=\"none\",outcome=\"local_error\",grpc_code=\"cancelled\"}"
             ),
             Some(1)
         );
@@ -731,25 +708,25 @@ mod tests {
         let metrics = MetricsCapture::install();
         let mut timer = RoutedRequestTimer::start(PeerRpc::Relay);
         timer.finish(&Ok::<(), Status>(()));
-        timer.client_error(&Status::unavailable("x"));
+        timer.local_error(&Status::unavailable("x"));
         drop(timer);
         assert_eq!(
             metrics.value(
-                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",target=\"ssh\",outcome=\"success\",grpc_code=\"ok\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",relay_kind=\"ssh\",outcome=\"success\",grpc_code=\"ok\"}"
             ),
             Some(1)
         );
-        assert!(!metrics.render().contains("outcome=\"client_error\""));
+        assert!(!metrics.render().contains("outcome=\"local_error\""));
     }
 
     #[test]
     fn local_relay_failure_records_status_without_peer_latency() {
         let metrics = MetricsCapture::install();
-        let mut timer = RoutedRequestTimer::relay(RelayTarget::Tcp, RelayRoute::Local);
+        let mut timer = RoutedRequestTimer::relay(RelayKind::Tcp, RelayRoute::Local);
         timer.finish(&Err::<(), _>(Status::resource_exhausted("capacity")));
         drop(timer);
         assert_eq!(
-            metrics.value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",target=\"tcp\",outcome=\"client_error\",grpc_code=\"resource_exhausted\"}"),
+            metrics.value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",relay_kind=\"tcp\",outcome=\"local_error\",grpc_code=\"resource_exhausted\"}"),
             Some(1)
         );
         assert!(!metrics.render().contains(PEER_REQUEST_DURATION_SECONDS));
