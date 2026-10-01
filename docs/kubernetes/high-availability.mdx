@@ -203,7 +203,7 @@ configuration, and access control.
 | Relay utilization | `openshell_server_relay_pending`, `openshell_server_relay_pending_capacity` | Graph it. It is transient and usually near 0, so alert on rejections instead. |
 | Relay rejections | `openshell_server_relay_rejected_total` | Alert on any increase. |
 | Relay claims | `openshell_server_relay_claim_duration_seconds`, `openshell_server_relay_expired_total` | Supervisor connect-back time for exec, SSH, forwarding, and service traffic, including relays requested through peers. A high 99th percentile while rejections stay flat points at the supervisor or its node, not at relay capacity. Relays not claimed within 10 seconds count only as expired, so alert on any increase. |
-| Peer requests | `openshell_server_peer_requests_total`, `openshell_server_peer_request_duration_seconds` | Cross-replica routing rate, failures, and latency. Spikes of `grpc_code="unavailable"` during rollouts are expected. |
+| Routed requests | `openshell_server_routed_request_attempts_total`, `openshell_server_peer_request_duration_seconds` | Local/peer relay setup mix and outbound peer rate, failures, and latency. Counts completed or cancelled attempts, including retries. Do not use as an HPA target. |
 
 These queries assume that Prometheus labels each series with `namespace` and
 `pod`:
@@ -219,14 +219,17 @@ sum by (namespace, pod, reason) (increase(openshell_server_relay_rejected_total[
 # 99th percentile time for supervisors to claim a relay on each replica.
 histogram_quantile(0.99, sum by (namespace, pod, le) (rate(openshell_server_relay_claim_duration_seconds_bucket[5m])))
 
+# Completed or cancelled relay setup attempts, by replica, target, and route.
+sum by (namespace, pod, target, route) (rate(openshell_server_routed_request_attempts_total{operation="relay"}[5m]))
+
 # Session skew across replicas. 1 means balanced. Starting and stopping pods
 # raise it during rollouts.
 max(openshell_server_supervisor_sessions)
   / clamp_min(avg(openshell_server_supervisor_sessions), 1)
 
-# Failed peer requests as a share of attempts, by RPC.
-sum by (method) (rate(openshell_server_peer_requests_total{outcome!="success"}[5m]))
-  / sum by (method) (rate(openshell_server_peer_requests_total[5m]))
+# Failed peer requests as a share of attempts, by operation.
+sum by (operation) (rate(openshell_server_routed_request_attempts_total{route="peer",outcome!="success"}[5m]))
+  / sum by (operation) (rate(openshell_server_routed_request_attempts_total{route="peer"}[5m]))
 
 # 99th percentile peer request latency across the fleet.
 histogram_quantile(0.99, sum by (le, method) (rate(openshell_server_peer_request_duration_seconds_bucket{outcome="success"}[5m])))

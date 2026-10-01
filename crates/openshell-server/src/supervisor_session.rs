@@ -28,7 +28,8 @@ use openshell_core::transport_errors::is_expected_transport_close_status;
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::gateway_metrics::{
-    self, GaugeSlot, PeerRequestTimer, PeerRpc, RelayCapacity, RelayRejection,
+    self, GaugeSlot, PeerRpc, RelayCapacity, RelayRejection, RelayRoute, RelayTarget,
+    RoutedRequestTimer,
 };
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
 use crate::persistence::ObjectId;
@@ -871,7 +872,7 @@ impl SupervisorSessionRegistry {
                     {
                         let mut pending = self.pending_relays.lock().unwrap();
                         if pending.len() >= MAX_PENDING_RELAYS {
-                            gateway_metrics::record_relay_rejected(RelayRejection::GlobalCapacity);
+                            gateway_metrics::record_relay_rejected(RelayRejection::ReplicaCapacity);
                             return Err(Status::resource_exhausted(format!(
                                 "gateway relay capacity reached ({MAX_PENDING_RELAYS} in flight)"
                             )));
@@ -1425,7 +1426,7 @@ pub(crate) async fn forward_provider_readiness_to_owner(
     request: ReportProviderReadinessRequest,
 ) -> Result<ReportProviderReadinessResponse, Status> {
     let sandbox_id = request.sandbox_id.clone();
-    let mut timer = PeerRequestTimer::start(PeerRpc::ReportProviderReadiness);
+    let mut timer = RoutedRequestTimer::start(PeerRpc::ReportProviderReadiness);
     let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
         .inspect_err(|status| timer.client_error(status))?;
@@ -1443,7 +1444,7 @@ pub(crate) async fn forward_endpoint_status_to_owner(
     request: ReportEndpointStatusRequest,
 ) -> Result<ReportEndpointStatusResponse, Status> {
     let sandbox_id = request.sandbox_id.clone();
-    let mut timer = PeerRequestTimer::start(PeerRpc::ReportEndpointStatus);
+    let mut timer = RoutedRequestTimer::start(PeerRpc::ReportEndpointStatus);
     let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
         .inspect_err(|status| timer.client_error(status))?;
@@ -1461,7 +1462,7 @@ pub(crate) async fn forward_provider_status_query_to_owner(
     sandbox_id: &str,
     request: GetSandboxProviderStatusRequest,
 ) -> Result<GetSandboxProviderStatusResponse, Status> {
-    let mut timer = PeerRequestTimer::start(PeerRpc::GetSandboxProviderStatus);
+    let mut timer = RoutedRequestTimer::start(PeerRpc::GetSandboxProviderStatus);
     let mut client = peer_rpc_client(state, &owner.owner_peer_endpoint)
         .await
         .inspect_err(|status| timer.client_error(status))?;
@@ -1495,6 +1496,14 @@ pub async fn open_routed_relay_with_target(
     open_routed_relay_with_message(state, sandbox_id, relay_open, session_wait_timeout).await
 }
 
+fn relay_target(relay_open: &RelayOpen) -> RelayTarget {
+    // An absent target means SSH for compatibility with older callers.
+    match relay_open.target.as_ref() {
+        Some(relay_open::Target::Ssh(_)) | None => RelayTarget::Ssh,
+        Some(relay_open::Target::Tcp(_)) => RelayTarget::Tcp,
+    }
+}
+
 pub async fn open_routed_relay_with_message(
     state: &Arc<ServerState>,
     sandbox_id: &str,
@@ -1513,11 +1522,13 @@ pub async fn open_routed_relay_with_message(
         let owner_index = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL);
         loop {
             if state.supervisor_sessions.has_session(sandbox_id) {
-                match state
+                let mut timer = RoutedRequestTimer::relay(relay_target(&relay_open), RelayRoute::Local);
+                let result = state
                     .supervisor_sessions
                     .open_relay_with_message_until(sandbox_id, relay_open.clone(), deadline, false)
-                    .await
-                {
+                    .await;
+                timer.finish(&result);
+                match result {
                     Ok(relay) => return Ok(relay),
                     Err(status) if status.code() == tonic::Code::Unavailable => {
                         // The session can migrate after `has_session` but before
@@ -1656,7 +1667,7 @@ async fn connect_peer_relay(
     sandbox_id: &str,
     relay_open: RelayOpen,
 ) -> Result<tokio::io::DuplexStream, Status> {
-    let mut timer = PeerRequestTimer::start(PeerRpc::Relay);
+    let mut timer = RoutedRequestTimer::relay(relay_target(&relay_open), RelayRoute::Peer);
     let token = state
         .peer_routes
         .peer_token()
@@ -2889,6 +2900,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_relay_sends_relay_open_to_registered_session() {
+        let metrics = MetricsCapture::install();
         let registry = SupervisorSessionRegistry::new();
         let (tx, mut rx) = mpsc::channel(4);
         registry.register("sbx".to_string(), "s1".to_string(), tx, make_shutdown());
@@ -2906,6 +2918,12 @@ mod tests {
             }
             other => panic!("expected RelayOpen, got {other:?}"),
         }
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::ROUTED_REQUEST_ATTEMPTS_TOTAL),
+            "owner-side registry opens must not count another routing attempt"
+        );
     }
 
     #[tokio::test]
@@ -3001,7 +3019,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
         assert!(err.message().contains("gateway relay capacity"));
         assert_eq!(
-            metrics.value("openshell_server_relay_rejected_total{reason=\"global_capacity\"}"),
+            metrics.value("openshell_server_relay_rejected_total{reason=\"replica_capacity\"}"),
             Some(1)
         );
         assert_eq!(metrics.value(gateway_metrics::RELAY_PENDING), Some(256));
@@ -3932,6 +3950,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn routed_relay_metrics_count_local_targets_including_legacy_ssh() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, mut rx) = mpsc::channel(4);
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "session-routing".into(),
+            tx,
+            make_shutdown(),
+        );
+
+        for (target, label, expected) in [
+            (Some(relay_open::Target::Ssh(SshRelayTarget {})), "ssh", 1),
+            (
+                Some(relay_open::Target::Tcp(
+                    openshell_core::proto::TcpRelayTarget {
+                        host: "127.0.0.1".into(),
+                        port: 12345,
+                    },
+                )),
+                "tcp",
+                1,
+            ),
+            (None, "ssh", 2),
+        ] {
+            let relay_open = RelayOpen {
+                target,
+                ..peer_relay_open(&Uuid::new_v4().to_string())
+            };
+            let (channel_id, _relay_rx) = open_routed_relay_with_message(
+                &state,
+                "sbx-routing",
+                relay_open.clone(),
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+            assert_eq!(channel_id, relay_open.channel_id);
+            assert_eq!(
+                rx.recv().await.unwrap().payload,
+                Some(gateway_message::Payload::RelayOpen(relay_open))
+            );
+            assert_eq!(
+                metrics.value(&format!(
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"local\",target=\"{label}\",outcome=\"success\",grpc_code=\"ok\"}}"
+                )),
+                Some(expected)
+            );
+        }
+        let rendered = metrics.render();
+        assert!(!rendered.contains("route=\"peer\""));
+        for identifier in ["sbx-routing", "session-routing", "127.0.0.1", "12345"] {
+            assert!(
+                !rendered.contains(identifier),
+                "must not label with {identifier}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_failed_local_setup() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "session-routing".into(),
+            tx,
+            make_shutdown(),
+        );
+
+        open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_millis(50),
+        )
+        .await
+        .expect_err("the local supervisor disconnected");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",target=\"ssh\",outcome=\"client_error\",grpc_code=\"unavailable\"}"
+            ),
+            Some(1)
+        );
+        assert!(!metrics.render().contains("route=\"peer\""));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_local_to_peer_fallback() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+        state
+            .peer_routes
+            .store_owner("sbx-routing", &owner_at(&endpoint));
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "old-session".into(),
+            tx,
+            make_shutdown(),
+        );
+
+        open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the peer accepts after the local supervisor disconnects");
+        for route in ["local", "peer"] {
+            let (outcome, code) = if route == "local" {
+                ("client_error", "unavailable")
+            } else {
+                ("success", "ok")
+            };
+            assert_eq!(
+                metrics.value(&format!(
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"{route}\",target=\"ssh\",outcome=\"{outcome}\",grpc_code=\"{code}\"}}"
+                )),
+                Some(1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_peer_targets() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::EmptyOk).await;
+        state
+            .peer_routes
+            .store_owner("sbx-routing", &owner_at(&endpoint));
+
+        for (target, label) in [
+            (relay_open::Target::Ssh(SshRelayTarget {}), "ssh"),
+            (
+                relay_open::Target::Tcp(openshell_core::proto::TcpRelayTarget {
+                    host: "127.0.0.1".into(),
+                    port: 12345,
+                }),
+                "tcp",
+            ),
+        ] {
+            let (_channel_id, _relay_rx) = open_routed_relay_with_target(
+                &state,
+                "sbx-routing",
+                target,
+                String::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                metrics.value(&format!(
+                    "openshell_server_routed_request_attempts_total{{operation=\"relay\",route=\"peer\",target=\"{label}\",outcome=\"success\",grpc_code=\"ok\"}}"
+                )),
+                Some(1)
+            );
+        }
+        let rendered = metrics.render();
+        assert!(!rendered.contains("route=\"local\""));
+        assert!(!rendered.contains(endpoint.trim_start_matches("http://")));
+        assert!(!rendered.contains("sbx-routing"));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_each_failed_peer_retry() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::Status(tonic::Code::Unavailable)).await;
+        SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sbx-routing",
+                "session",
+                "instance",
+                1,
+                "replica-owner",
+                &endpoint,
+            )
+            .await
+            .unwrap();
+
+        open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the peer rejects every attempt");
+        let attempts = metrics
+            .value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",target=\"ssh\",outcome=\"rpc_error\",grpc_code=\"unavailable\"}")
+            .unwrap();
+        assert!(attempts > 1, "the routing loop must have retried");
+        assert_eq!(
+            metrics.value(
+                "openshell_server_peer_request_duration_seconds_count{method=\"PeerRelay\",outcome=\"rpc_error\"}"
+            ),
+            Some(attempts)
+        );
+        assert!(!metrics.render().contains("route=\"local\""));
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_do_not_count_waiting_for_an_owner() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        open_routed_relay_with_message(
+            &state,
+            "sbx-missing",
+            peer_relay_open("ch-routing"),
+            Duration::from_millis(250),
+        )
+        .await
+        .expect_err("no supervisor or owner is available");
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::ROUTED_REQUEST_ATTEMPTS_TOTAL)
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_relay_metrics_count_cancelled_local_setup_once() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(GatewayMessage::default()).unwrap();
+        state.supervisor_sessions.register(
+            "sbx-routing".into(),
+            "session-routing".into(),
+            tx,
+            make_shutdown(),
+        );
+        let mut setup = Box::pin(open_routed_relay_with_message(
+            &state,
+            "sbx-routing",
+            peer_relay_open("ch-routing"),
+            Duration::from_secs(5),
+        ));
+        tokio::select! {
+            result = &mut setup => panic!("setup should wait for queue space: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::ROUTED_REQUEST_ATTEMPTS_TOTAL)
+        );
+        drop(setup);
+        assert_eq!(
+            metrics.value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"local\",target=\"ssh\",outcome=\"client_error\",grpc_code=\"cancelled\"}"),
+            Some(1)
+        );
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::PEER_REQUEST_DURATION_SECONDS)
+        );
+    }
+
+    #[tokio::test]
     async fn peer_relay_metrics_keep_owner_code_before_unavailable_remap() {
         let metrics = MetricsCapture::install();
         let state = crate::grpc::test_support::test_server_state().await;
@@ -3944,7 +4232,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unavailable);
         assert_eq!(
             metrics.value(
-                "openshell_server_peer_requests_total{method=\"PeerRelay\",outcome=\"rpc_error\",grpc_code=\"resource_exhausted\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",target=\"ssh\",outcome=\"rpc_error\",grpc_code=\"resource_exhausted\"}"
             ),
             Some(1)
         );
@@ -3986,7 +4274,7 @@ mod tests {
             .expect("the owner accepted the relay");
         assert_eq!(
             metrics.value(
-                "openshell_server_peer_requests_total{method=\"PeerRelay\",outcome=\"success\",grpc_code=\"ok\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",target=\"ssh\",outcome=\"success\",grpc_code=\"ok\"}"
             ),
             Some(1)
         );
@@ -4010,7 +4298,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unavailable);
         assert_eq!(
             metrics.value(
-                "openshell_server_peer_requests_total{method=\"PeerGetSandboxProviderStatus\",outcome=\"client_error\",grpc_code=\"unavailable\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"get_sandbox_provider_status\",route=\"peer\",target=\"none\",outcome=\"client_error\",grpc_code=\"unavailable\"}"
             ),
             Some(1)
         );
@@ -4042,7 +4330,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert_eq!(
             metrics.value(
-                "openshell_server_peer_requests_total{method=\"PeerReportEndpointStatus\",outcome=\"rpc_error\",grpc_code=\"permission_denied\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"report_endpoint_status\",route=\"peer\",target=\"none\",outcome=\"rpc_error\",grpc_code=\"permission_denied\"}"
             ),
             Some(1)
         );
@@ -4067,7 +4355,7 @@ mod tests {
         .expect("the owner accepted the report");
         assert_eq!(
             metrics.value(
-                "openshell_server_peer_requests_total{method=\"PeerReportProviderReadiness\",outcome=\"success\",grpc_code=\"ok\"}"
+                "openshell_server_routed_request_attempts_total{operation=\"report_provider_readiness\",route=\"peer\",target=\"none\",outcome=\"success\",grpc_code=\"ok\"}"
             ),
             Some(1)
         );

@@ -520,7 +520,7 @@ for pod in $(kubectl -n openshell get pod \
     -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
   echo "${pod}"
   kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
-    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|peer_requests_total)'
+    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
 done
 kubectl -n openshell get hpa
 kubectl -n openshell describe hpa openshell
@@ -542,7 +542,7 @@ kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
 pf_pid=$!
 sleep 2
 curl -s http://localhost:9090/metrics \
-  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|peer_requests_total)'
+  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
 kill "${pf_pid}"
 ```
 

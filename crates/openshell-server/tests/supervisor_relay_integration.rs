@@ -938,7 +938,7 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
     );
     assert_eq!(
         metrics
-            .value("openshell_server_relay_rejected_total{reason=\"global_capacity\"}")
+            .value("openshell_server_relay_rejected_total{reason=\"replica_capacity\"}")
             .unwrap_or(0),
         0
     );
@@ -1010,7 +1010,7 @@ async fn open_relay_enforces_replica_cap_under_concurrent_burst() {
 
     assert_eq!(metrics.value("openshell_server_relay_pending"), Some(256));
     assert_eq!(
-        metrics.value("openshell_server_relay_rejected_total{reason=\"global_capacity\"}"),
+        metrics.value("openshell_server_relay_rejected_total{reason=\"replica_capacity\"}"),
         Some(32)
     );
     assert_eq!(
