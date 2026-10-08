@@ -1447,6 +1447,10 @@ async fn replacement_reset_timeout_invalidates_superseded_evidence() {
             if status.endpoint_statuses[0].last_result == EndpointResult::NoObservedExchange as i32
             {
                 assert!(status.endpoint_statuses[0].last_reported_time.is_none());
+                assert_eq!(status.phase, SandboxPhase::Provisioning as i32);
+                assert!(status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready" && condition.status == "False"
+                }));
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

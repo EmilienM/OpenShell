@@ -12,6 +12,8 @@
 
 mod endpoint_status;
 mod provisioning_clock;
+#[cfg(test)]
+mod token_grant_owners_tests;
 pub use provisioning_clock::configuration_change;
 
 pub(super) use endpoint_status::{
@@ -812,7 +814,7 @@ fn evaluate_proposal_candidate(
         rule_name: rule_name.clone(),
         rule: rule.clone(),
     }];
-    let candidate_base = match merge_policy(base_policy.clone(), &operations) {
+    let mut candidate_base = match merge_policy(base_policy.clone(), &operations) {
         Ok(result) => result.policy,
         Err(error) => {
             let application_error = format!("merge failed: {}", one_line(&error.to_string()));
@@ -834,6 +836,7 @@ fn evaluate_proposal_candidate(
         }
     };
 
+    clear_provider_credentialed_markers(&mut candidate_base);
     let validation = (|| -> Result<ProtoSandboxPolicy, Status> {
         validate_policy_safety(&candidate_base)?;
         validate_candidate_effective_policy(&candidate_base, validation_context.provider_layers)?;
@@ -1922,7 +1925,9 @@ async fn current_effective_policy_for_sandbox(
         &provider_names,
     )
     .await?;
-    current_effective_policy_from_records(state, catalog, sandbox, sandbox_id, &records).await
+    current_effective_policy_from_records(state, catalog, sandbox, sandbox_id, &records)
+        .await
+        .map(|(policy, _)| policy)
 }
 
 async fn current_effective_policy_from_records(
@@ -1931,7 +1936,7 @@ async fn current_effective_policy_from_records(
     sandbox: &Sandbox,
     sandbox_id: &str,
     records: &[super::provider::ProviderEnvironmentRecord],
-) -> Result<ProtoSandboxPolicy, Status> {
+) -> Result<(ProtoSandboxPolicy, PolicySource), Status> {
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
         // A global policy is the complete effective policy. Dormant sandbox
@@ -1941,7 +1946,8 @@ async fn current_effective_policy_from_records(
             provider_policy_context_from_records(catalog, records),
             global_policy,
             PolicySource::Global,
-        );
+        )
+        .map(|policy| (policy, PolicySource::Global));
     }
 
     let policy = if let Some(record) = state
@@ -1965,6 +1971,7 @@ async fn current_effective_policy_from_records(
         policy,
         PolicySource::Sandbox,
     )
+    .map(|policy| (policy, PolicySource::Sandbox))
 }
 
 async fn effective_policy_for_source(
@@ -2028,6 +2035,9 @@ fn apply_captured_policy_context(
         &provider_context.endpointless_provider_names,
     );
     stamp_provider_credentialed_endpoints(&mut policy, &provider_context.credentialed_scopes);
+    if matches!(policy_source, PolicySource::Global) {
+        openshell_core::policy_identity::stamp_global_token_grant_owners(&mut policy);
+    }
 
     Ok(policy)
 }
@@ -2937,6 +2947,9 @@ pub(super) async fn load_sandbox_config(
             effective_policy,
             &provider_policy_context.credentialed_scopes,
         );
+        if matches!(policy_source, PolicySource::Global) {
+            openshell_core::policy_identity::stamp_global_token_grant_owners(effective_policy);
+        }
         if let Err(error) = validate_uninspected_credentialed_endpoints(effective_policy) {
             configuration_error = bounded_configuration_diagnostic(error.message());
         }
@@ -2977,6 +2990,9 @@ pub(super) async fn load_sandbox_config(
         &provider_profile_catalog,
         &provider_records,
         &policy_credential_bindings,
+        policy
+            .as_ref()
+            .filter(|_| matches!(policy_source, PolicySource::Global)),
     )?;
 
     Ok(GetSandboxConfigResponse {
@@ -3114,6 +3130,7 @@ fn compute_provider_env_revision_from_records(
         catalog,
         records,
         &HashMap::new(),
+        None,
     )
 }
 
@@ -3121,6 +3138,7 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     catalog: &EffectiveProviderProfileCatalog,
     records: &[super::provider::ProviderEnvironmentRecord],
     policy_bindings: &HashMap<String, Vec<StaticCredentialEndpointBinding>>,
+    global_policy: Option<&ProtoSandboxPolicy>,
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
     hasher.update(b"openshell-provider-env-revision-v4");
@@ -3156,6 +3174,13 @@ fn compute_provider_env_revision_from_records_and_policy_bindings(
     }
 
     hash_policy_credential_bindings(policy_bindings, &mut hasher);
+
+    if let Some(policy) = global_policy {
+        // Global policy replaces the grant owner list. Its changes must trigger
+        // a provider refetch even when the attached provider records are unchanged.
+        hasher.update(b"global-token-grant-authority");
+        hasher.update(deterministic_policy_hash(policy).as_bytes());
+    }
 
     let digest = hasher.finalize();
     Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
@@ -3311,6 +3336,11 @@ fn provider_policy_context_from_records(
 
         let rule_name = openshell_policy::provider_rule_name(provider.object_name());
         let mut rule = profile.network_policy_rule(&rule_name);
+        let owners =
+            openshell_core::policy_identity::provider_token_grant_owners(&record.object_id, &rule);
+        for (endpoint, owner) in rule.endpoints.iter_mut().zip(owners) {
+            endpoint.token_grant_owner = owner;
+        }
         if rule.endpoints.is_empty() {
             endpointless_provider_names.insert(name.clone());
         }
@@ -3398,6 +3428,7 @@ pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolic
     for rule in policy.network_policies.values_mut() {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
+            endpoint.token_grant_owner.clear();
         }
     }
 }
@@ -3549,7 +3580,7 @@ pub(super) async fn load_sandbox_provider_environment(
         &provider_names,
     )
     .await?;
-    let effective_policy = current_effective_policy_from_records(
+    let (effective_policy, policy_source) = current_effective_policy_from_records(
         state.as_ref(),
         &provider_profile_catalog,
         sandbox,
@@ -3569,6 +3600,7 @@ pub(super) async fn load_sandbox_provider_environment(
         &provider_profile_catalog,
         &provider_records,
         &policy_credential_bindings,
+        matches!(policy_source, PolicySource::Global).then_some(&effective_policy),
     )?;
     let mut provider_environment =
         super::provider::resolve_provider_environment_from_records_with_policy_bindings_and_credentials(
@@ -3580,6 +3612,25 @@ pub(super) async fn load_sandbox_provider_environment(
             Some(&sandbox_id),
         )
         .await?;
+
+    if matches!(policy_source, PolicySource::Global) {
+        // A global policy replaces provider ACLs. Grants retain their profile
+        // destination selectors, but only the selected global endpoint may
+        // authorize their use. Keeping every global owner avoids reimplementing
+        // host/path intersection here; the relay checks both selectors.
+        let mut owners: Vec<_> = effective_policy
+            .network_policies
+            .values()
+            .flat_map(|rule| &rule.endpoints)
+            .map(|endpoint| endpoint.token_grant_owner.clone())
+            .filter(|owner| !owner.is_empty())
+            .collect();
+        owners.sort();
+        owners.dedup();
+        for credential in provider_environment.dynamic_credentials.values_mut() {
+            credential.token_grant_owners.clone_from(&owners);
+        }
+    }
 
     let mut readiness_reason = provider_environment.readiness_reason;
 
@@ -7093,7 +7144,8 @@ fn validate_operator_merged_credential_policy(
         bindings,
         context.endpointless_provider_names,
     );
-    clear_provider_credentialed_markers(effective_policy);
+    // Recompute the credential flags without clearing owner IDs that provider
+    // composition already derived for this effective policy.
     stamp_provider_credentialed_endpoints(effective_policy, &credentialed_scopes);
     validate_uninspected_credentialed_endpoints(effective_policy)
 }
@@ -7106,7 +7158,8 @@ fn stage_validated_merge_operation(
     validate_merge_operations_for_server(std::slice::from_ref(operation))?;
     let merged = merge_policy(current_policy.clone(), std::slice::from_ref(operation))
         .map_err(map_policy_merge_error)?;
-    let candidate = merged.policy;
+    let mut candidate = merged.policy;
+    clear_provider_credentialed_markers(&mut candidate);
     validate_policy_safety(&candidate)?;
     validate_candidate_effective_policy(&candidate, validation_context.provider_layers)?;
     let mut effective = if validation_context.provider_layers.is_empty() {
@@ -7139,13 +7192,14 @@ async fn apply_merge_operations_with_retry(
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-        let (current_policy, current_hash) = if let Some(ref record) = latest {
+        let (mut current_policy, current_hash) = if let Some(ref record) = latest {
             let (policy, hash) = canonical_policy_record_identity(record)?;
             (policy, Some(hash))
         } else {
             (baseline_policy.cloned().unwrap_or_default(), None)
         };
 
+        clear_provider_credentialed_markers(&mut current_policy);
         if let Some(expected_hash) = expected_current_effective_hash {
             let mut current_effective = if provider_layers.is_empty() {
                 current_policy.clone()
@@ -7168,7 +7222,8 @@ async fn apply_merge_operations_with_retry(
         }
 
         let merged = merge_policy(current_policy, operations).map_err(map_policy_merge_error)?;
-        let new_policy = merged.policy;
+        let mut new_policy = merged.policy;
+        clear_provider_credentialed_markers(&mut new_policy);
         let hash = deterministic_policy_hash(&new_policy);
 
         if let Some(baseline_policy) = baseline_policy {
@@ -8535,9 +8590,11 @@ mod tests {
         let settings = load_global_settings(state.store.as_ref())
             .await
             .expect("test global settings lookup");
-        decode_policy_from_global_settings(&settings)
+        let mut policy = decode_policy_from_global_settings(&settings)
             .expect("test global policy must decode")
-            .expect("test global policy must be present")
+            .expect("test global policy must be present");
+        openshell_core::policy_identity::stamp_global_token_grant_owners(&mut policy);
+        policy
     }
 
     #[tokio::test]
@@ -11273,7 +11330,7 @@ mod tests {
         assert!(loaded.spec.unwrap().policy.is_none());
     }
 
-    fn test_provider(name: &str, provider_type: &str) -> Provider {
+    pub(super) fn test_provider(name: &str, provider_type: &str) -> Provider {
         Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: format!("provider-{name}"),
@@ -18737,6 +18794,19 @@ mod tests {
                         read_write: vec!["/sandbox".to_string()],
                         ..Default::default()
                     }),
+                    network_policies: HashMap::from([(
+                        "authored_existing".to_string(),
+                        NetworkPolicyRule {
+                            name: "authored_existing".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.example.test".to_string(),
+                                port: 443,
+                                token_grant_owner: "forged-source-owner".to_string(),
+                                ..Default::default()
+                            }],
+                            binaries: Vec::new(),
+                        },
+                    )]),
                     ..Default::default()
                 }),
                 providers: vec!["work-custom".to_string()],
@@ -18746,6 +18816,19 @@ mod tests {
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
+        let stored_source = sandbox.spec.as_ref().unwrap().policy.as_ref().unwrap();
+        state
+            .store
+            .put_policy_revision(
+                "policy-agent-provider-effective-policy",
+                sandbox_id,
+                "default",
+                1,
+                &stored_source.encode_to_vec(),
+                &deterministic_policy_hash(stored_source),
+            )
+            .await
+            .unwrap();
 
         let proposed_rule = NetworkPolicyRule {
             name: "github_contents_write".to_string(),
@@ -18765,6 +18848,7 @@ mod tests {
                     }),
                 }],
                 advisor_proposed: true,
+                token_grant_owner: "forged-proposal-owner".to_string(),
                 ..Default::default()
             }],
             binaries: vec![NetworkBinary {
@@ -18841,6 +18925,20 @@ mod tests {
         .await
         .expect("provider-overlap proposal should approve");
 
+        let candidate = chunk.candidate_effective_policy.as_ref().unwrap();
+        for rule_name in ["authored_existing", "github_contents_write"] {
+            assert!(
+                candidate.network_policies[rule_name].endpoints[0]
+                    .token_grant_owner
+                    .is_empty()
+            );
+        }
+        assert!(
+            !candidate.network_policies["_provider_work_custom"].endpoints[0]
+                .token_grant_owner
+                .is_empty()
+        );
+
         let stored = state
             .store
             .get_latest_policy(sandbox_id)
@@ -18860,7 +18958,19 @@ mod tests {
             "provider-composed rules must not be copied into the mutable base policy"
         );
 
+        assert!(
+            base_policy
+                .network_policies
+                .values()
+                .flat_map(|rule| &rule.endpoints)
+                .all(|endpoint| endpoint.token_grant_owner.is_empty())
+        );
+
         let effective_policy = get_sandbox_policy(&state, sandbox_id).await;
+        assert_eq!(
+            deterministic_policy_hash(&effective_policy),
+            chunk.candidate_effective_policy_hash
+        );
         let provider_rule = &effective_policy.network_policies["_provider_work_custom"];
         assert_eq!(
             provider_rule.endpoints[0].access,
@@ -18868,6 +18978,7 @@ mod tests {
         );
         assert_eq!(provider_rule.endpoints[0].deny_rules.len(), 1);
         assert!(!provider_rule.endpoints[0].advisor_proposed);
+        assert!(!provider_rule.endpoints[0].token_grant_owner.is_empty());
         assert!(
             effective_policy
                 .network_policies
