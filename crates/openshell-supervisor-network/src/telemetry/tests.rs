@@ -237,24 +237,24 @@ async fn concurrent_decisions_keep_companions_and_request_contexts_separate() {
                             let mut context = (*openshell_ocsf::ctx::ctx()).clone();
                             context.sandbox_id = host.to_string();
                             context.sandbox_name = format!("sandbox-{host}");
-                            openshell_ocsf::ctx::bind_thread_ctx(Some(Arc::new(context)));
-                            let connect = tracing::debug_span!("supervisor.egress.connect");
-                            connect.in_scope(|| {
-                                for attempt in 0..2 {
-                                    let decision = format!("{host}:{attempt}");
-                                    let event = http_deny(host, &decision);
-                                    let finding = openshell_ocsf::DetectionFindingBuilder::new(
-                                        openshell_ocsf::ctx::ctx(),
-                                    )
-                                    .message(&decision)
-                                    .build();
-                                    super::emit_decision([event, finding], None);
-                                    // Both threads finish each decision before either
-                                    // starts the next.
-                                    barrier.wait();
-                                }
+                            openshell_ocsf::ctx::scope_ctx_sync(Arc::new(context), || {
+                                let connect = tracing::debug_span!("supervisor.egress.connect");
+                                connect.in_scope(|| {
+                                    for attempt in 0..2 {
+                                        let decision = format!("{host}:{attempt}");
+                                        let event = http_deny(host, &decision);
+                                        let finding = openshell_ocsf::DetectionFindingBuilder::new(
+                                            openshell_ocsf::ctx::ctx(),
+                                        )
+                                        .message(&decision)
+                                        .build();
+                                        super::emit_decision([event, finding], None);
+                                        // Both threads finish each decision before either
+                                        // starts the next.
+                                        barrier.wait();
+                                    }
+                                });
                             });
-                            openshell_ocsf::ctx::bind_thread_ctx(None);
                             assert_eq!(openshell_ocsf::ctx::ctx().sandbox_id, outside);
                         });
                     });

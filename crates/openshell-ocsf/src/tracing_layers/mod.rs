@@ -15,5 +15,7 @@ pub use event_bridge::{
     OCSF_TARGET, clear_current_event, clone_current_event, emit_ocsf_event, emit_ocsf_event_routed,
     register_event_enricher, set_current_event,
 };
-pub use jsonl_layer::{OcsfJsonSettings, OcsfJsonlLayer, bind_thread_json_settings};
+pub use jsonl_layer::{
+    OcsfJsonSettings, OcsfJsonlLayer, scope_json_settings, scope_json_settings_sync,
+};
 pub use shorthand_layer::OcsfShorthandLayer;

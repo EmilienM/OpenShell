@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use miette::Result;
+use openshell_core::instance_tasks;
 #[cfg(unix)]
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
@@ -168,7 +169,7 @@ async fn start_optional_ssh(
     };
     let host_key = host_key.ok_or_else(|| miette::miette!("sandbox SSH host key is missing"))?;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
+    let task = instance_tasks::spawn(async move {
         if let Err(error) = crate::ssh::run_ssh_server(
             socket_path,
             ready_tx,

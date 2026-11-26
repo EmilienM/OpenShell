@@ -36,6 +36,7 @@ use openshell_core::denial::DenialEvent;
 use openshell_core::endpoint_status::{
     EndpointObservationContext, EndpointObservationSender, EndpointResult,
 };
+use openshell_core::instance_tasks;
 use openshell_core::net::{
     connect_tcp_nodelay_best_effort, is_always_blocked_ip, is_internal_ip, is_link_local_ip,
     set_tcp_nodelay_best_effort,
@@ -429,7 +430,7 @@ impl ProxyHandle {
         }
 
         let (exited_tx, exited_rx) = tokio::sync::oneshot::channel::<()>();
-        let join = tokio::spawn(async move {
+        let join = instance_tasks::spawn(async move {
             // Hold the sender for the lifetime of this task — when the task
             // exits (panic, abort, or loop break), the sender drops and the
             // receiver fires, notifying the sandbox that the proxy is gone.
@@ -498,7 +499,7 @@ impl ProxyHandle {
                                     let dtx = denial_tx.clone();
                                     let has_policy_local = policy_local_ctx.is_some();
                                     let reserved = reserved_destination.clone();
-                                    tokio::spawn(async move {
+                                    instance_tasks::spawn(async move {
                                         if let Some(connection) = preauthorize_transparent_open(
                                             connection,
                                             dns_service.as_ref(),
@@ -569,7 +570,7 @@ impl ProxyHandle {
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
                         let required_authorization = required_proxy_authorization.clone();
-                        tokio::spawn(async move {
+                        instance_tasks::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_mediated_connection(
                                 tokio::io::BufReader::new(stream),
@@ -683,7 +684,7 @@ async fn preauthorize_transparent_open(
             // If the sandbox side is already gone, dropping `served` closes
             // the stream and releases the handler's slot.
             if completion.send(TcpOpenDecision::RelayReady).is_ok() {
-                tokio::spawn(served);
+                instance_tasks::spawn(served);
             }
         } else {
             // The handler refuses when its connection cap is reached or once
@@ -1356,7 +1357,7 @@ impl TransparentTcpHandle {
             let activity_tx = activity_tx.clone();
             let upstream_proxy = upstream_proxy.clone();
             let mut engine_ready = engine_ready.clone();
-            joins.push(tokio::spawn(async move {
+            joins.push(instance_tasks::spawn(async move {
                 if tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     engine_ready.wait_for(|ready| *ready),
@@ -1381,7 +1382,7 @@ impl TransparentTcpHandle {
                     let denial_tx = denial_tx.clone();
                     let activity_tx = activity_tx.clone();
                     let upstream_proxy = upstream_proxy.clone();
-                    tokio::spawn(async move {
+                    instance_tasks::spawn(async move {
                         if let Err(error) = handle_transparent_tcp_connection(
                             stream,
                             dns,
@@ -1436,6 +1437,25 @@ pub(crate) fn correlated_endpoint(
         .find(|candidate| mapping.endpoint_ids().any(|mapped| mapped == candidate))
 }
 
+/// Turn a failed blocking identity-resolution task into the egress denial.
+///
+/// A cancelled closure means the sandbox instance ended before the queued work
+/// could start, and a mismatched value means a backend handed back the wrong
+/// type; neither is a panic. All three cases fail the authorization closed.
+fn identity_resolution_error(error: instance_tasks::BlockingTaskError) -> miette::Report {
+    match error {
+        instance_tasks::BlockingTaskError::Panicked => {
+            miette::miette!("identity resolution task panicked: {error}")
+        }
+        instance_tasks::BlockingTaskError::Cancelled => {
+            miette::miette!("identity resolution task cancelled: {error}")
+        }
+        instance_tasks::BlockingTaskError::Mismatched => {
+            miette::miette!("identity resolution task returned an unexpected value: {error}")
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_transparent_tcp_connection(
@@ -1475,11 +1495,11 @@ async fn handle_transparent_tcp_connection(
     let cache = identity_cache.clone();
     let pid = entrypoint_pid.clone();
     let parent = connect_span.clone();
-    let decision = tokio::task::spawn_blocking(move || {
+    let decision = instance_tasks::run_blocking(move || {
         parent.in_scope(|| authorize_egress_intent(connection, &engine, &cache, &pid, intent))
     })
     .await
-    .map_err(|error| miette::miette!("identity resolution task panicked: {error}"))?;
+    .map_err(identity_resolution_error)?;
 
     if let NetworkAction::Deny { reason } = &decision.action {
         emit_transparent_policy_denial(&decision, workload_addr, &host, port);
@@ -2826,14 +2846,14 @@ fn virtual_connect_stream(
     let (handler, bridge) = tokio::io::duplex(64 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge);
     let (mut workload_read, mut workload_write) = tokio::io::split(workload);
-    tokio::spawn(async move {
+    instance_tasks::spawn(async move {
         let request = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n");
         if bridge_write.write_all(request.as_bytes()).await.is_ok() {
             let _ = tokio::io::copy(&mut workload_read, &mut bridge_write).await;
         }
         let _ = bridge_write.shutdown().await;
     });
-    tokio::spawn(async move {
+    instance_tasks::spawn(async move {
         let mut header = Vec::with_capacity(256);
         let mut byte = [0_u8; 1];
         while header.len() < MAX_HEADER_BYTES {
@@ -3096,7 +3116,7 @@ async fn handle_mediated_connection(
         let cache_clone = identity_cache.clone();
         let pid_clone = entrypoint_pid.clone();
         let parent = connect_span.clone();
-        tokio::task::spawn_blocking(move || {
+        instance_tasks::run_blocking(move || {
             parent.in_scope(|| {
                 authorize_egress_intent(
                     connection,
@@ -3108,7 +3128,7 @@ async fn handle_mediated_connection(
             })
         })
         .await
-        .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
+        .map_err(identity_resolution_error)?
     };
 
     debug!(
@@ -5978,7 +5998,7 @@ async fn handle_forward_proxy_inner(
         let cache_clone = identity_cache.clone();
         let pid_clone = entrypoint_pid.clone();
         let parent = connect_span.clone();
-        tokio::task::spawn_blocking(move || {
+        instance_tasks::run_blocking(move || {
             parent.in_scope(|| {
                 authorize_egress_intent(
                     connection,
@@ -5990,7 +6010,7 @@ async fn handle_forward_proxy_inner(
             })
         })
         .await
-        .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?
+        .map_err(identity_resolution_error)?
     };
 
     debug!(

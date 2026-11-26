@@ -11,6 +11,7 @@ use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use openshell_core::instance_tasks;
 use openshell_core::proto::{
     Decision, HttpRequestTarget, MiddlewareSessionEnd, MiddlewareSessionEndReason,
     MiddlewareSessionProtocolError, RequestContext, SupervisorMiddlewarePhase, WebSocketMessage,
@@ -177,11 +178,9 @@ impl WebSocketStageTransport {
         if self.sender.try_send(session_end_request(reason)).is_err() {
             return;
         }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            drop(runtime.spawn(async move {
-                let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.drain()).await;
-            }));
-        }
+        drop(instance_tasks::spawn_if_in_runtime(async move {
+            let _ = tokio::time::timeout(SESSION_END_TIMEOUT, self.drain()).await;
+        }));
     }
 }
 
@@ -1374,7 +1373,32 @@ fn session_end_request(reason: MiddlewareSessionEndReason) -> WebSocketSessionEv
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use openshell_core::instance_tasks::{
+        InstanceTaskBackend, InstanceTasks, ScopedBlockingOutput, ScopedBlockingTask, ScopedTask,
+    };
+
     use super::*;
+
+    struct RecordingBackend {
+        spawns: Arc<AtomicUsize>,
+    }
+
+    impl InstanceTaskBackend for RecordingBackend {
+        fn spawn_scoped(&self, task: ScopedTask) -> tokio::task::JoinHandle<()> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(task)
+        }
+
+        fn spawn_scoped_blocking(
+            &self,
+            task: ScopedBlockingTask,
+        ) -> tokio::task::JoinHandle<Option<ScopedBlockingOutput>> {
+            tokio::task::spawn_blocking(move || Some(task()))
+        }
+    }
 
     #[test]
     fn session_end_refines_only_protocol_errors() {
@@ -1481,6 +1505,37 @@ mod tests {
         assert!(
             requests.try_recv().is_err(),
             "disabled stage must receive at most one session end"
+        );
+    }
+
+    /// The fire-and-forget drain of an instance-owned stage must join the
+    /// instance's task tree instead of escaping to the shared runtime.
+    #[tokio::test]
+    async fn end_now_spawns_the_drain_through_the_ambient_instance() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(RecordingBackend {
+            spawns: spawns.clone(),
+        });
+        let (sender, mut requests) = mpsc::channel(1);
+        let transport = WebSocketStageTransport {
+            sender,
+            responses: Box::pin(tokio_stream::empty()),
+        };
+
+        InstanceTasks::new(backend)
+            .scope(async move {
+                transport.end_now(MiddlewareSessionEndReason::Normal);
+            })
+            .await;
+
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "the drain must be spawned through the instance that owns the stage"
+        );
+        assert!(
+            requests.recv().await.is_some(),
+            "the session end must be queued before the drain is spawned"
         );
     }
 }

@@ -42,6 +42,7 @@ use crate::boundary_protocol::{
     encode_frame, read_stream_frame, validate_resource_claims, write_stream_frame,
 };
 use crate::mediation::{self, DnsQueryWire, MediationFrame, MediationFrameKind};
+use openshell_core::instance_tasks;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Initial attachment may include runtime image pulls and trusted bootstrap
@@ -1155,8 +1156,8 @@ async fn open_process_attachment(
     let (stdin, stdin_pump) = tokio::io::duplex(64 * 1024);
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(pump_exec_input(stdin_pump, network_writer));
-    tokio::spawn(pump_process_responses(
+    instance_tasks::spawn(pump_exec_input(stdin_pump, network_writer));
+    instance_tasks::spawn(pump_process_responses(
         network_reader,
         stdout_pump,
         stderr_pump,
@@ -1354,8 +1355,8 @@ async fn open_exec_session(
     let (stdout, stdout_pump) = tokio::io::duplex(64 * 1024);
     let (stderr, stderr_pump) = tokio::io::duplex(64 * 1024);
     let (output_status_tx, output_status_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(pump_exec_input(stdin_pump, network_writer));
-    tokio::spawn(pump_process_responses(
+    instance_tasks::spawn(pump_exec_input(stdin_pump, network_writer));
+    instance_tasks::spawn(pump_process_responses(
         network_reader,
         stdout_pump,
         stderr_pump,
@@ -1451,7 +1452,7 @@ impl NetworkMediationSource {
         };
         let (decision, completion) = tokio::sync::oneshot::channel();
         let (proxy_stream, transport_stream) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             complete_network_open(stream, transport_stream, completion).await;
             drop(permit);
         });
@@ -1540,7 +1541,7 @@ impl ClientMediationSession {
             dns: tokio::sync::Mutex::new(dns_rx),
             healthy: healthy.clone(),
         });
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             if let Err(error) = run_client_mediation(stream, dns_tx).await {
                 tracing::debug!(%error, "persistent mediation session ended");
             }
@@ -1600,7 +1601,7 @@ async fn dispatch_client_mediation_frame(
             let (response, completion) =
                 tokio::sync::oneshot::channel::<Result<Vec<u8>, BackendError>>();
             let outbound = outbound.clone();
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 let response = match completion.await {
                     Ok(Ok(response)) => DnsQueryResultWire::Response(response),
                     Ok(Err(error)) => DnsQueryResultWire::Error(error.to_string()),
@@ -2393,7 +2394,7 @@ impl BoundaryClient {
             return;
         }
         let client = Arc::downgrade(self);
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 let Some(client) = client.upgrade() else {
@@ -2923,7 +2924,7 @@ async fn grpc_request<F: ProtocolFrame>(
         .send(F::bind(boundary_id))
         .await
         .map_err(|_| BackendError::Unavailable("queue boundary binding frame".into()))?;
-    tokio::spawn(pump_to_grpc(bridge, outbound));
+    instance_tasks::spawn(pump_to_grpc(bridge, outbound));
     let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
     request
         .metadata_mut()

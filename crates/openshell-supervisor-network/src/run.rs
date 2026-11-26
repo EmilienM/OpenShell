@@ -42,6 +42,7 @@ pub use crate::token_grant::ProviderIdentitySource;
 use crate::token_grant::{GatewayTokenGrantResolver, SpiffeTokenGrantResolver};
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::grpc_client::GatewayEndpoint;
+use openshell_core::instance_tasks;
 
 /// Concrete listener options supplied by trusted supervisor composition.
 /// This is not an isolation-backend capability or a serialized launch contract.
@@ -365,7 +366,7 @@ pub async fn run_networking(
             let resolve_engine = engine.clone();
             let resolve_proto = proto.clone();
             let resolve_pid = entrypoint_pid.clone();
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 // Phase 1: wait for run_process to publish the entrypoint PID.
                 // 20 attempts * 250ms = 5s window.
                 let mut pid = 0;

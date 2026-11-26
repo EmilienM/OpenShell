@@ -36,6 +36,7 @@ use tracing::{info, warn};
 use self::buffer::new_buffer;
 use self::exporter::Exporter;
 use self::receiver::{OtlpConnectionServer, ReceiverHandle};
+use openshell_core::instance_tasks;
 
 /// Maximum accepted request body, in wire bytes.
 pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -459,7 +460,7 @@ fn assemble(
     let (server, receiver) =
         OtlpConnectionServer::new(buffer_tx, sandbox_id, Arc::clone(&counters));
 
-    let export_task = tokio::spawn({
+    let export_task = instance_tasks::spawn({
         let counters = Arc::clone(&counters);
         async move {
             if let Some(mut gate) = export_gate {
@@ -473,7 +474,7 @@ fn assemble(
             }
         }
     });
-    let summary_task = tokio::spawn(summary_loop(Arc::clone(&counters)));
+    let summary_task = instance_tasks::spawn(summary_loop(Arc::clone(&counters)));
 
     let reserved = ReservedDestination {
         addr: relay_addr(),

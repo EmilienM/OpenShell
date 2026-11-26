@@ -37,6 +37,7 @@ pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
 pub mod image;
+pub mod instance_tasks;
 pub mod isolation_registration;
 pub mod jwt;
 pub mod local_api_socket;

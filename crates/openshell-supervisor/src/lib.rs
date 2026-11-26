@@ -32,6 +32,8 @@ mod provider_readiness;
 pub mod sandbox_instance_host;
 pub mod shared_host;
 #[cfg(test)]
+mod task_scope_spike;
+#[cfg(test)]
 #[path = "../../../tests/support/environment.rs"]
 mod test_environment;
 
@@ -48,6 +50,7 @@ use tracing::{Instrument as _, debug, info, warn};
 use openshell_core::PolicyValidationFailureMode;
 use openshell_supervisor_control::RegistrationTraceContext;
 
+use openshell_core::instance_tasks;
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
     DetectionFindingBuilder, DispositionId, EventContext, FindingInfo, OcsfEvent, SeverityId,
@@ -993,9 +996,9 @@ impl SandboxInstanceConfig {
 /// Live state bound to one sandbox instance, prepared once by its owner.
 ///
 /// A dedicated supervisor shares these with its process-wide logging and log
-/// push; a hosted instance binds them to every thread of its runtime. Every
-/// gateway client of the instance, including log push and credential renewal,
-/// uses the same `gateway_credentials`, so renewal by one keeps all current.
+/// push; a hosted instance scopes every task it spawns to them. Every gateway
+/// client of the instance, including log push and credential renewal, uses the
+/// same `gateway_credentials`, so renewal by one keeps all current.
 #[derive(Clone)]
 pub struct SandboxInstanceBindings {
     /// Gateway credentials issued from the instance's auth bundle.
@@ -1003,8 +1006,8 @@ pub struct SandboxInstanceBindings {
     pub event_context: Arc<EventContext>,
     /// OCSF JSON output settings this instance's gateway configuration controls.
     pub ocsf_json: openshell_ocsf::OcsfJsonSettings,
-    /// Log push destination of a hosted instance's threads. A dedicated
-    /// process pushes through its process-wide layer instead.
+    /// Log push destination of a hosted instance's tasks. A dedicated process
+    /// pushes through its process-wide layer instead.
     pub log_sink: Option<openshell_supervisor_process::log_push::LogSink>,
     /// Source of `policy.local` recent denials.
     pub denial_log: openshell_supervisor_network::policy_local::DenialLogSource,
@@ -1066,7 +1069,7 @@ impl SandboxInstanceReadiness {
             };
         };
         let sender = readiness.clone();
-        let forward = tokio::spawn(async move {
+        let forward = instance_tasks::spawn(async move {
             loop {
                 sender.send_replace(*accepted.borrow_and_update());
                 if accepted.changed().await.is_err() {
@@ -1141,8 +1144,8 @@ pub async fn run_sandbox_instance(
         otlp_agent_endpoint,
         otlp_agent_protocol,
     } = config;
-    // The owner binds the event context and log sink to the instance's
-    // threads; the instance itself uses the rest.
+    // The owner scopes the event context and log sink to the instance's
+    // tasks; the instance itself uses the rest.
     let SandboxInstanceBindings {
         gateway_credentials,
         ocsf_json,
@@ -1581,7 +1584,7 @@ pub async fn run_sandbox_instance(
         let denial_workspace_gate = workspace_rx.clone();
         let denial_workspace_rx = workspace_rx.clone();
 
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             aggregator
                 .run(
                     |summaries| {
@@ -1626,7 +1629,7 @@ pub async fn run_sandbox_instance(
         let activity_workspace_gate = workspace_rx.clone();
         let activity_workspace_rx = workspace_rx.clone();
 
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             aggregator
                 .run(
                     move |summary| {
@@ -1725,7 +1728,7 @@ pub async fn run_sandbox_instance(
             supervisor_session_id: supervisor_session_id.clone(),
         };
 
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let mut workload_started = workload_started_rx;
             if workload_started.wait_for(|started| *started).await.is_err() {
                 return;
@@ -2052,7 +2055,7 @@ fn boundary_exit_code(status: openshell_isolation_interface::contract::BoundaryE
 fn observe_adopted_execs(processes: &[Arc<openshell_sandbox_backend::BoundaryProcess>]) {
     for process in processes {
         let process = process.clone();
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             match process.wait().await {
                 Ok(status) => info!(
                     process_id = %process.process_id(),

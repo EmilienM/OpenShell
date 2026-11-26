@@ -83,7 +83,14 @@ from sandbox runtimes)",
         .enable_all()
         .build()
         .into_diagnostic()?;
-    runtime.block_on(async {
+    // Sandbox instances run on their own bounded runtime, so instance load
+    // cannot starve the control-plane runtime. It is shut down from this
+    // thread once `block_on` returns: shutting a runtime down from inside
+    // another runtime's context panics.
+    let instance_runtime =
+        openshell_supervisor::sandbox_instance_host::instance_host_runtime().into_diagnostic()?;
+    let instance_runtime_handle = instance_runtime.handle().clone();
+    let result = runtime.block_on(async {
         openshell_crypto::tls::ensure_default_provider();
         let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
@@ -129,6 +136,7 @@ from sandbox runtimes)",
             openshell_supervisor::shared_host::SharedHostConfig {
                 gateway_endpoint,
                 instance_root,
+                instance_runtime: instance_runtime_handle,
                 runtime_listen,
                 removal_grace: openshell_supervisor_control::INSTANCE_REMOVAL_GRACE,
                 attach_request_timeout: std::time::Duration::from_secs(
@@ -175,7 +183,12 @@ from sandbox runtimes)",
         // gateway grants it to; the workloads keep running.
         host.shut_down().await;
         Ok(())
-    })
+    });
+    // Every instance has been relinquished; stop the runtime that hosted
+    // their tasks before this thread returns.
+    instance_runtime
+        .shutdown_timeout(openshell_supervisor::sandbox_instance_host::RUNTIME_SHUTDOWN_TIMEOUT);
+    result
 }
 
 /// Answer kubelet `tcpSocket` probes: accept and close. Liveness means the

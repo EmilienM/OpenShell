@@ -9,6 +9,7 @@
 //! credit. The SSH exit status reports the result.
 
 use super::input::{InputProgress, InputState};
+use openshell_core::instance_tasks;
 use openshell_core::upload::{ACK_INTERVAL_BYTES, PlanError, PlanReader, UploadPlan, WINDOW_BYTES};
 use openshell_sandbox_backend::BoundaryProcess;
 use russh::ChannelId;
@@ -71,7 +72,7 @@ impl Upload {
         progress: watch::Receiver<InputProgress>,
         process: Arc<BoundaryProcess>,
     ) -> Finisher {
-        let acks = tokio::spawn(send_acks(
+        let acks = instance_tasks::spawn(send_acks(
             handle,
             channel,
             progress.clone(),
@@ -116,7 +117,7 @@ impl Drop for Upload {
         if self.reject()
             && let Some(process) = self.process.take()
         {
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 let _ = process.terminate().await;
             });
         }

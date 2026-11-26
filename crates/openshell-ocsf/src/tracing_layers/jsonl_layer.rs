@@ -3,6 +3,7 @@
 
 //! Tracing layer that writes OCSF JSONL or marked console records to a writer.
 
+use std::future::Future;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,22 +18,38 @@ use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
 /// OCSF JSON output settings owned by one hosted sandbox instance.
 ///
-/// Instances apply their own `ocsf_json_enabled` setting to this value. Binding them to the instance's runtime threads makes every
-/// [`OcsfJsonlLayer`] use them for events those threads emit.
+/// Instances apply their own `ocsf_json_enabled` setting to this value. Scoping
+/// the instance's tasks to them makes every [`OcsfJsonlLayer`] use them for
+/// events those tasks emit.
 #[derive(Clone, Debug, Default)]
 pub struct OcsfJsonSettings {
     pub enabled: Arc<AtomicBool>,
 }
 
-std::thread_local! {
-    static THREAD_JSON_SETTINGS: std::cell::RefCell<Option<OcsfJsonSettings>> =
-        const { std::cell::RefCell::new(None) };
+tokio::task_local! {
+    /// JSON settings of the hosted sandbox instance whose task is being polled.
+    static TASK_JSON_SETTINGS: OcsfJsonSettings;
 }
 
-/// Apply one hosted sandbox instance's JSON settings to events emitted on this
-/// thread.
-pub fn bind_thread_json_settings(settings: Option<OcsfJsonSettings>) {
-    THREAD_JSON_SETTINGS.with(|current| *current.borrow_mut() = settings);
+/// Run `future` with its task's OCSF events using `settings`.
+pub async fn scope_json_settings<F: Future>(settings: OcsfJsonSettings, future: F) -> F::Output {
+    TASK_JSON_SETTINGS.scope(settings, future).await
+}
+
+/// Run the synchronous `f` with OCSF events using `settings`.
+///
+/// Tokio task scopes do not reach blocking closures, so an instance's
+/// `spawn_blocking` work re-enters the scope with this variant.
+pub fn scope_json_settings_sync<F, T>(settings: OcsfJsonSettings, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    TASK_JSON_SETTINGS.sync_scope(settings, f)
+}
+
+/// Resolve the settings that apply to an event from its emitting task's scope.
+fn scoped_json_settings() -> Option<OcsfJsonSettings> {
+    TASK_JSON_SETTINGS.try_with(Clone::clone).ok()
 }
 
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
@@ -93,7 +110,7 @@ where
         }
 
         // A hosted sandbox instance's settings replace the process-wide ones.
-        let instance = THREAD_JSON_SETTINGS.with(|current| current.borrow().clone());
+        let instance = scoped_json_settings();
         let enabled = instance
             .as_ref()
             .map_or(self.enabled.as_ref(), |settings| Some(&settings.enabled));
@@ -126,10 +143,94 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builders::{BaseEventBuilder, test_sandbox_context};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn emit(message: &str) {
+        crate::ocsf_emit!(
+            BaseEventBuilder::new(&test_sandbox_context())
+                .message(message)
+                .build()
+        );
+    }
+
+    fn dispatch(writer: SharedWriter) -> tracing::Dispatch {
+        tracing::Dispatch::new(tracing_subscriber::registry().with(OcsfJsonlLayer::new(writer)))
+    }
 
     #[test]
     fn test_jsonl_layer_creation() {
         let buffer: Vec<u8> = Vec::new();
         let _layer = OcsfJsonlLayer::new(buffer);
+    }
+
+    #[tokio::test]
+    async fn a_task_scope_controls_the_layer_and_does_not_cross_a_plain_spawn() {
+        let writer = SharedWriter::default();
+        let dispatch = dispatch(writer.clone());
+        let disabled = OcsfJsonSettings {
+            enabled: Arc::new(AtomicBool::new(false)),
+        };
+
+        scope_json_settings(disabled, async {
+            tracing::dispatcher::with_default(&dispatch, || emit("hidden"));
+        })
+        .await;
+        assert!(
+            writer.0.lock().unwrap().is_empty(),
+            "task-scoped settings must win over the layer's own flag"
+        );
+
+        // A plain spawn is not re-scoped, so it uses the layer's own flag.
+        tokio::spawn(async move {
+            tracing::dispatcher::with_default(&dispatch, || emit("unscoped"));
+        })
+        .await
+        .unwrap();
+        assert!(
+            !writer.0.lock().unwrap().is_empty(),
+            "unscoped events must not inherit an instance's settings"
+        );
+    }
+
+    #[test]
+    fn sync_scope_controls_the_layer_for_blocking_work() {
+        let writer = SharedWriter::default();
+        let dispatch = dispatch(writer.clone());
+        let disabled = OcsfJsonSettings {
+            enabled: Arc::new(AtomicBool::new(false)),
+        };
+
+        scope_json_settings_sync(disabled, || {
+            tracing::dispatcher::with_default(&dispatch, || emit("hidden"));
+        });
+        assert!(writer.0.lock().unwrap().is_empty());
+
+        scope_json_settings_sync(
+            OcsfJsonSettings {
+                enabled: Arc::new(AtomicBool::new(true)),
+            },
+            || {
+                tracing::dispatcher::with_default(&dispatch, || emit("written"));
+            },
+        );
+        assert!(!writer.0.lock().unwrap().is_empty());
     }
 }

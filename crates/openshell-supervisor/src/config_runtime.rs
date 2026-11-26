@@ -37,6 +37,7 @@ use crate::{
     reload_gateway_configuration_runtime, retain_extension_credentials, run_policy_status_reporter,
     unchanged_policy_revision_candidate, unchanged_policy_revision_ready_to_ack,
 };
+use openshell_core::instance_tasks;
 
 async fn receive_config_apply(
     receiver: &mut Option<tokio::sync::mpsc::Receiver<ConfigApplyRequest>>,
@@ -1234,13 +1235,13 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
         .clone()
         .map(crate::app_listener::Routes::configuration_guard);
     let (status_sender, status_receiver) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(run_policy_status_reporter(
+    instance_tasks::spawn(run_policy_status_reporter(
         client.clone(),
         ctx.sandbox_id.clone(),
         status_receiver,
     ));
     if let Some(endpoint_status_receiver) = ctx.endpoint_status_rx.take() {
-        tokio::spawn(endpoint_status::run_reporter(
+        instance_tasks::spawn(endpoint_status::run_reporter(
             client.clone(),
             ctx.sandbox_id.clone(),
             endpoint_status_receiver,

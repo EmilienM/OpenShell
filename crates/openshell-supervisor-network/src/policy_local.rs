@@ -21,6 +21,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 
+use openshell_core::instance_tasks;
+
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
 /// Filesystem path of the static agent guidance bundle inside the sandbox.
@@ -447,7 +449,7 @@ async fn recent_denials_response(
         Ok(files) if !files.is_empty()
     );
 
-    let denials = tokio::task::spawn_blocking(move || read_recent_denial_lines(&log_dir, limit))
+    let denials = instance_tasks::run_blocking(move || read_recent_denial_lines(&log_dir, limit))
         .await
         .unwrap_or_default();
 

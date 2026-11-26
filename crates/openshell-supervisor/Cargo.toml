@@ -55,6 +55,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tonic-types = { workspace = true }
 tracing = { workspace = true }

@@ -57,7 +57,9 @@ impl BuiltinMiddlewareService {
             + 'static,
     {
         let (responses_tx, responses_rx) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(async move {
+        // Route the pump through the ambient instance so it joins the owning
+        // sandbox's task tree and carries its identity when one hosts it.
+        openshell_core::instance_tasks::spawn(async move {
             let mut config = None;
             let mut started = false;
             let mut sequence_lower_bound = Some(1u64);

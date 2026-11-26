@@ -12,6 +12,7 @@ use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedRes
 use crate::policy_engine::PolicyEngine;
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::instance_tasks;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
@@ -138,7 +139,7 @@ impl PolicyDnsRuntime {
             trusted_host_gateway,
         ));
         let dns_service = service.clone();
-        let task = tokio::spawn(async move {
+        let task = instance_tasks::spawn(async move {
             if engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
             }
@@ -154,7 +155,7 @@ impl PolicyDnsRuntime {
                 let source = source.clone();
                 accepts.push(accept_mediated_dns(source).boxed());
                 let service = dns_service.clone();
-                tokio::spawn(async move {
+                instance_tasks::spawn(async move {
                     let timing = query.timing.clone();
                     let response = match query.transport {
                         DnsTransport::Udp => {
@@ -190,7 +191,7 @@ impl PolicyDnsRuntime {
             }
         });
         let expiry_store = store;
-        let expiry_task = tokio::spawn(async move {
+        let expiry_task = instance_tasks::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;
@@ -241,7 +242,7 @@ impl PolicyDnsRuntime {
         let udp = Arc::new(udp);
         let udp_concurrency = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UDP_QUERIES));
         let mut udp_engine_ready = engine_ready.clone();
-        let udp_task = tokio::spawn(async move {
+        let udp_task = instance_tasks::spawn(async move {
             if udp_engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
             }
@@ -256,7 +257,7 @@ impl PolicyDnsRuntime {
                 let request = request[..length].to_vec();
                 let service = udp_service.clone();
                 let udp = udp.clone();
-                tokio::spawn(async move {
+                instance_tasks::spawn(async move {
                     let _permit = permit;
                     // Without IPv6 egress, AAAA receives NOERROR/NODATA so
                     // dual-stack clients fall back to the usable IPv4 path.
@@ -271,7 +272,7 @@ impl PolicyDnsRuntime {
 
         let mut tcp_engine_ready = engine_ready;
         let tcp_service = service.clone();
-        let tcp_task = tokio::spawn(async move {
+        let tcp_task = instance_tasks::spawn(async move {
             if tcp_engine_ready.wait_for(|ready| *ready).await.is_err() {
                 return;
             }
@@ -281,7 +282,7 @@ impl PolicyDnsRuntime {
                 };
                 set_tcp_nodelay_best_effort(&stream);
                 let service = tcp_service.clone();
-                tokio::spawn(async move {
+                instance_tasks::spawn(async move {
                     // DNS-over-TCP connections may carry multiple sequential
                     // length-prefixed messages. libc commonly reuses one
                     // connection for A and AAAA during getaddrinfo().
@@ -309,7 +310,7 @@ impl PolicyDnsRuntime {
             }
         });
         let expiry_store = store;
-        let expiry_task = tokio::spawn(async move {
+        let expiry_task = instance_tasks::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
                 interval.tick().await;

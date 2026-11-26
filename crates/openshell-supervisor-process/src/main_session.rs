@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
+use openshell_core::instance_tasks;
 use openshell_isolation_interface::contract::BoundarySignal;
 
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
@@ -258,7 +259,7 @@ impl MainSession {
             terminal_attachments_done: Notify::new(),
         });
         let stdout_session = Arc::clone(&session);
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let mut stdout = stdout;
             let mut buffer = [0u8; 4096];
             loop {
@@ -272,7 +273,7 @@ impl MainSession {
         });
         if let Some(mut stderr) = stderr {
             let stderr_session = Arc::clone(&session);
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 let mut buffer = [0u8; 4096];
                 loop {
                     match stderr.read(&mut buffer).await {
@@ -284,7 +285,7 @@ impl MainSession {
                 stderr_session.reader_finished();
             });
         }
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let mut stdin = stdin;
             while let Some(data) = input_rx.recv().await {
                 if stdin.write_all(&data).await.is_err() {

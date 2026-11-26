@@ -28,6 +28,7 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+use openshell_core::instance_tasks;
 use openshell_core::proto::{
     Decision, HeaderMutation, HttpBegin, HttpBodyLimits, HttpBodyMode, HttpBodyModeUnavailable,
     HttpBodyUnavailableReason, HttpDenial, HttpFinish, HttpHeader, HttpInputChunk, HttpInputEnd,
@@ -626,16 +627,14 @@ impl Drop for StageStream {
             return;
         };
         let mut results = std::mem::replace(&mut self.results, Box::pin(futures::stream::empty()));
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                end_exchange(
-                    sender,
-                    &mut results,
-                    MiddlewareSessionEndReason::Cancellation,
-                )
-                .await;
-            });
-        }
+        drop(instance_tasks::spawn_if_in_runtime(async move {
+            end_exchange(
+                sender,
+                &mut results,
+                MiddlewareSessionEndReason::Cancellation,
+            )
+            .await;
+        }));
     }
 }
 
@@ -2499,4 +2498,77 @@ pub fn fail_open_invocation(entry: &DescribedChainEntry, reason: &str) -> HttpSt
 
 fn nonempty(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use openshell_core::instance_tasks::{
+        InstanceTaskBackend, InstanceTasks, ScopedBlockingOutput, ScopedBlockingTask, ScopedTask,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{EventSender, StageResult, StageStream};
+
+    struct RecordingBackend {
+        spawns: Arc<AtomicUsize>,
+    }
+
+    impl InstanceTaskBackend for RecordingBackend {
+        fn spawn_scoped(&self, task: ScopedTask) -> tokio::task::JoinHandle<()> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(task)
+        }
+
+        fn spawn_scoped_blocking(
+            &self,
+            task: ScopedBlockingTask,
+        ) -> tokio::task::JoinHandle<Option<ScopedBlockingOutput>> {
+            tokio::task::spawn_blocking(move || Some(task()))
+        }
+    }
+
+    fn stage_stream(sender: EventSender) -> StageStream {
+        StageStream {
+            sender: Some(sender),
+            results: Box::pin(futures::stream::empty::<
+                Result<Option<StageResult>, tonic::Status>,
+            >()),
+            ended: false,
+        }
+    }
+
+    /// A dropped, still-open stage must route its end exchange through the
+    /// instance that owns it instead of escaping to the shared runtime.
+    #[tokio::test]
+    async fn drop_spawns_the_end_exchange_through_the_ambient_instance() {
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(RecordingBackend {
+            spawns: spawns.clone(),
+        });
+        let (sender, mut events) = mpsc::channel(1);
+        let stream = stage_stream(EventSender::Request(sender));
+
+        InstanceTasks::new(backend)
+            .scope(async move {
+                drop(stream);
+            })
+            .await;
+
+        assert_eq!(
+            spawns.load(Ordering::SeqCst),
+            1,
+            "the end exchange must be spawned through the instance that owns the stage"
+        );
+        drop(events.try_recv());
+    }
+
+    /// Drop must not panic when no runtime is available to spawn the drain.
+    #[test]
+    fn drop_outside_a_runtime_does_not_spawn_or_panic() {
+        let (sender, _events) = mpsc::channel(1);
+        drop(stage_stream(EventSender::Request(sender)));
+    }
 }

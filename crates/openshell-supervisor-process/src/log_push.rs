@@ -8,8 +8,9 @@
 //! the server using the `PushSandboxLogs` client-streaming RPC.
 
 use openshell_core::grpc_client::{CachedOpenShellClient, GatewayEndpoint};
+use openshell_core::instance_tasks;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
-use std::cell::RefCell;
+use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};
@@ -34,25 +35,40 @@ impl LogSink {
     }
 }
 
-std::thread_local! {
-    /// Sink of the hosted sandbox instance whose runtime owns this thread.
-    static THREAD_SINK: RefCell<Option<LogSink>> = const { RefCell::new(None) };
+tokio::task_local! {
+    /// Sink of the hosted sandbox instance whose task is being polled.
+    static TASK_SINK: LogSink;
 }
 
-/// Route events emitted on the calling thread to a hosted sandbox instance's
-/// sink.
+/// Run `future` with its task's events pushed to `sink`.
 ///
-/// Hosted instances bind every thread of their runtime. Unbound threads push
-/// nothing, so an event cannot reach another sandbox's log stream.
-pub fn bind_thread_sink(sink: Option<LogSink>) {
-    THREAD_SINK.with(|current| *current.borrow_mut() = sink);
+/// A hosted sandbox instance enters this scope for every task it spawns, so a
+/// migrated task keeps pushing to its own sandbox's stream.
+pub async fn scope_sink<F: Future>(sink: LogSink, future: F) -> F::Output {
+    TASK_SINK.scope(sink, future).await
+}
+
+/// Run the synchronous `f` with its events pushed to `sink`.
+///
+/// Tokio task scopes do not reach blocking closures, so an instance's
+/// `spawn_blocking` work re-enters the scope with this variant.
+pub fn scope_sink_sync<F, T>(sink: LogSink, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    TASK_SINK.sync_scope(sink, f)
+}
+
+/// Resolve the sink of an event from its emitting task's scope.
+fn scoped_sink() -> Option<LogSink> {
+    TASK_SINK.try_with(Clone::clone).ok()
 }
 
 #[derive(Clone)]
 enum Route {
     /// The process supervises one sandbox; every event belongs to it.
     Fixed(LogSink),
-    /// Events belong to the sandbox instance bound to the emitting thread, if any.
+    /// Events belong to the sandbox instance scoping the emitting task, if any.
     ThreadBound,
 }
 
@@ -71,7 +87,7 @@ impl LogPushLayer {
         Self::with_route(Route::Fixed(LogSink::new(sandbox_id, tx)))
     }
 
-    /// Push each event to the sink bound to its emitting thread.
+    /// Push each event to the sink scoping its emitting task, if any.
     #[must_use]
     pub fn thread_bound() -> Self {
         Self::with_route(Route::ThreadBound)
@@ -99,11 +115,11 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
         }
         match &self.route {
             Route::Fixed(sink) => push_event(sink, event),
-            Route::ThreadBound => THREAD_SINK.with(|sink| {
-                if let Some(sink) = sink.borrow().as_ref() {
-                    push_event(sink, event);
+            Route::ThreadBound => {
+                if let Some(sink) = scoped_sink() {
+                    push_event(&sink, event);
                 }
-            }),
+            }
         }
     }
 }
@@ -173,7 +189,7 @@ pub fn start_log_push(
     sandbox_id: String,
     lines: mpsc::Receiver<SandboxLogLine>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_push_loop(gateway, sandbox_id, lines))
+    instance_tasks::spawn(run_push_loop(gateway, sandbox_id, lines))
 }
 
 /// Maximum backoff delay between reconnection attempts.
@@ -222,7 +238,7 @@ async fn run_push_loop(
         // Spawn the gRPC streaming call. When the call ends (success or error),
         // `rpc_done_tx` fires so the batch loop below knows whether to retry.
         let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel::<bool>(1);
-        tokio::spawn({
+        instance_tasks::spawn({
             let mut nav_client = client.raw_client();
             async move {
                 let fatal_auth = match nav_client.push_sandbox_logs(stream).await {
@@ -524,6 +540,71 @@ mod tests {
         assert_eq!(parse_max_level(Some("debug")), tracing::Level::DEBUG);
         assert_eq!(parse_max_level(Some("TRACE")), tracing::Level::TRACE);
         assert_eq!(parse_max_level(Some("warn")), tracing::Level::WARN);
+    }
+
+    #[tokio::test]
+    async fn a_task_scope_routes_events_to_its_own_sink_and_does_not_cross_a_plain_spawn() {
+        let (alpha_tx, mut alpha) = mpsc::channel::<SandboxLogLine>(16);
+        let (beta_tx, mut beta) = mpsc::channel::<SandboxLogLine>(16);
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(LogPushLayer {
+            route: Route::ThreadBound,
+            max_level: tracing::Level::INFO,
+        }));
+
+        scope_sink(LogSink::new("sandbox-alpha", alpha_tx), async {
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::info!(target: "scoped", "emitted by alpha");
+            });
+        })
+        .await;
+        let line = alpha
+            .recv()
+            .await
+            .expect("a scoped event reaches its instance's sink");
+        assert_eq!(line.sandbox_id, "sandbox-alpha");
+        assert_eq!(line.message, "emitted by alpha");
+        assert!(
+            beta.try_recv().is_err(),
+            "another instance must not receive it"
+        );
+
+        scope_sink(LogSink::new("sandbox-beta", beta_tx), async {
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::info!(target: "scoped", "emitted by beta");
+            });
+        })
+        .await;
+        assert_eq!(beta.try_recv().unwrap().sandbox_id, "sandbox-beta");
+        assert!(alpha.try_recv().is_err());
+
+        // A plain spawn is not re-scoped, so unbound work pushes nothing.
+        tokio::spawn(async move {
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::info!(target: "unbound", "escaped");
+            });
+        })
+        .await
+        .unwrap();
+        assert!(alpha.try_recv().is_err());
+        assert!(beta.try_recv().is_err());
+    }
+
+    #[test]
+    fn sync_scope_pushes_blocking_events_to_the_scoped_sink() {
+        let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(16);
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(LogPushLayer {
+            route: Route::ThreadBound,
+            max_level: tracing::Level::INFO,
+        }));
+
+        scope_sink_sync(LogSink::new("sandbox-blocking", tx), || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                tracing::info!(target: "scoped", "emitted while blocking");
+            });
+        });
+
+        let line = rx.try_recv().expect("blocking event reaches its sink");
+        assert_eq!(line.sandbox_id, "sandbox-blocking");
     }
 
     fn test_line(message: &str) -> SandboxLogLine {

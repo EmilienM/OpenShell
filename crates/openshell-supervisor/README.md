@@ -66,13 +66,21 @@ when the boundary returned it, otherwise the workload is reported as
 terminated.
 
 `sandbox_instance_host::SandboxInstanceHost` runs several sandbox instances in
-one process. Each instance gets its own Tokio runtime; every thread of that
-runtime, and the thread driving it, is bound to the instance's
-`SandboxInstanceBindings`: OCSF context, OCSF JSON settings, log sink, and
-denial log. Spawned tasks, blocking work,
-callbacks, reconnects, and renewal therefore inherit the instance's identity,
-and threads outside an instance carry none and push no logs. The OCSF context
-also supplies the sandbox identity in middleware requests.
+one process. All instances share one multi-thread runtime owned by the host
+and separate from the control-plane runtime, with
+`INSTANCE_HOST_WORKER_THREADS` workers (capped by the machine's parallelism)
+and a stated blocking-thread ceiling of 256, kept well above the worker count
+because every instance shares the pool. Instance identity
+therefore cannot live on worker threads: each instance's
+`SandboxInstanceBindings` (OCSF context, OCSF JSON settings, log sink, and
+denial log) is installed in per-crate task scopes by the instance's
+`InstanceSpawner`, which every instance task is spawned through. Tasks,
+blocking work, callbacks, reconnects, and renewal start inside the scopes of
+the instance that spawns them, and work outside an instance carries no
+identity and pushes no logs. Code in crates that cannot name the spawner uses
+`openshell_core::instance_tasks::{spawn, spawn_blocking, run_blocking}`, which
+find the ambient instance and fall back to plain tokio outside one. The OCSF
+context also supplies the sandbox identity in middleware requests.
 
 The host is the one registry of its instances. `admit` validates that the key
 is a single path component, then, under the registry lock, accepts the same
@@ -83,19 +91,30 @@ prepares its bindings and body there. A failed admission retains no entry;
 its directory is deleted on a best-effort basis, and the next admission of the
 key must delete any stale files before reusing it.
 
-Removing an instance stops its workload, shuts down only its runtime, which
-drops its runtime route, and revokes its gateway credentials; only then is its
-private directory deleted and its key released, so a replacement can never
-meet the old instance's resources. Removal runs on one detached task that
-every remover joins, so a caller that disconnects cannot cancel it, and it
-checks the entry's serial before releasing the key. If the directory cannot
-be deleted, the key stays reserved and reports a failed phase, and the next
-removal retries the deletion. An instance that panics reports a failure and
-is revoked the same way. An instance that is still starting is cancelled at
-once; the sandbox runtime then loses supervision and fails closed, as it does
-when a dedicated supervisor exits. A hosted instance without an explicit proxy
-trust directory uses its private directory. Hosted processes must install
-`LogPushLayer::thread_bound` and an `OcsfShorthandLayer` writing to
+Removing an instance stops its workload, cancels and joins only its task
+tree, which drops its runtime route, and revokes its gateway credentials; only
+then is its private directory deleted and its key released, so a replacement
+can never meet the old instance's resources. Cancellation is cooperative, so a
+tracked task without a cancellation branch of its own ends at its next await
+point and a normal removal completes without spending the five-second bound;
+the root keeps its own cancellation branch so it reports why the instance
+ended. What ignores cancellation is aborted, with the abort pass repeated for
+work registered while one runs, and removal waits a fresh five-second window
+for it to drop and run its exit guards. Blocking work already running on the
+blocking pool cannot be aborted, so removal joins it within a final window
+instead; a blocking closure still queued when the instance ends is skipped
+rather than starting after removal, so the bounds are what keep removal finite.
+Removal runs on one detached
+task that every remover joins, so a caller that disconnects cannot cancel it,
+and it checks the entry's serial before releasing the key. If the directory
+cannot be deleted, the key stays reserved and reports a failed phase, and the
+next removal retries the deletion. An instance that panics reports a failure
+and is revoked the same way. An instance that is still starting is cancelled
+at once; the sandbox runtime then loses supervision and fails closed, as it
+does when a dedicated supervisor exits. A hosted instance without an explicit
+proxy trust directory uses its private directory. Hosted processes must
+install `LogPushLayer::thread_bound` (which resolves the instance task scope
+first, then the thread binding) and an `OcsfShorthandLayer` writing to
 `SandboxInstanceDenialWriter`.
 
 ## Suspend and resume

@@ -40,6 +40,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
+use openshell_core::instance_tasks;
 use openshell_core::transport_errors::is_expected_transport_close_status;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -437,7 +438,7 @@ pub fn spawn_with_readiness(
         supported_capabilities: runtime.supported_capabilities,
         ready_tx,
     };
-    (tokio::spawn(run_session_loop(config)), ready_rx)
+    (instance_tasks::spawn(run_session_loop(config)), ready_rx)
 }
 
 struct SessionConfig {
@@ -890,7 +891,7 @@ fn spawn_config_apply(
     sandbox_id: &str,
 ) {
     let sandbox_id = sandbox_id.to_string();
-    tokio::spawn(async move {
+    instance_tasks::spawn(async move {
         let result = apply_update(&apply_tx, update).await;
         if tx
             .send(SupervisorMessage {
@@ -1049,7 +1050,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 relay_open_event(&openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 let event_open = relay_open.clone();
                 match handle_relay_open(
                     relay_open,
@@ -1227,7 +1228,7 @@ where
     // Target → gRPC (out_tx): read local target, forward as `RelayFrame::data`.
     // `out_tx` is owned by this task, so dropping it on target EOF ends the
     // outbound stream immediately, without waiting on the inbound side.
-    let target_to_grpc = tokio::spawn(async move {
+    let target_to_grpc = instance_tasks::spawn(async move {
         let mut buf = vec![0u8; RELAY_CHUNK_SIZE];
         loop {
             match target_r.read(&mut buf).await {

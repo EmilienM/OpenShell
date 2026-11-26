@@ -9,6 +9,7 @@
 //! depending on the orchestrator. This module hosts the aggregator that
 //! runs orchestrator-side and flushes summaries to the gateway.
 
+use openshell_core::instance_tasks;
 use std::collections::HashMap;
 use std::future::Future;
 use tokio::sync::mpsc;
@@ -55,7 +56,7 @@ impl ActivityAggregator {
     {
         let (flush_tx, mut flush_rx) =
             mpsc::channel::<FlushableActivitySummary>(ACTIVITY_FLUSH_QUEUE_CAPACITY);
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             while let Some(summary) = flush_rx.recv().await {
                 flush_callback(summary).await;
             }

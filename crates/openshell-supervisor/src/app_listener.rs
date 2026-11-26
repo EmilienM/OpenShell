@@ -15,9 +15,10 @@ use http::{Method, Request, Response, StatusCode, Version, header};
 use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 use hyper::rt::Executor as _;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::grpc_client::SettingsPollResult;
+use openshell_core::instance_tasks;
 use openshell_core::proto::{SandboxServiceRoute, ServiceBackendHttpVersion};
 use openshell_isolation_interface::contract::{BoundaryDuplexStream, LoopbackTarget};
 use openshell_ocsf::{
@@ -28,7 +29,7 @@ use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::Mutex;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 
@@ -631,7 +632,7 @@ impl Registration {
 /// Process-owned listener. Dropping it stops acceptance without affecting
 /// another host process. Individual instance lifetimes are independent.
 pub struct HostHandle {
-    task: tokio::task::JoinHandle<()>,
+    task: JoinHandle<()>,
     router: Router,
 }
 
@@ -663,7 +664,7 @@ pub struct InstanceListener {
 }
 
 pub struct Handle {
-    task: tokio::task::JoinHandle<()>,
+    task: JoinHandle<()>,
     routes: Routes,
 }
 
@@ -755,18 +756,48 @@ struct Permits {
     relays: Arc<Semaphore>,
 }
 
+/// Connections owned by an instance listener.
+///
+/// Handles are kept instead of a `JoinSet` so each connection can be spawned
+/// through the ambient instance, which tracks it and scopes its identity, while
+/// dropping the set still aborts every connection, as a dropped `JoinSet` did.
+#[derive(Default)]
+struct Connections(Vec<JoinHandle<()>>);
+
+impl Connections {
+    /// Forget handles whose connection has finished, keeping the set bounded
+    /// by live connections.
+    fn prune(&mut self) {
+        self.0.retain(|connection| !connection.is_finished());
+    }
+
+    fn push(&mut self, connection: JoinHandle<()>) {
+        self.0.push(connection);
+    }
+}
+
+impl Drop for Connections {
+    fn drop(&mut self) {
+        for connection in &self.0 {
+            connection.abort();
+        }
+    }
+}
+
 impl InstanceListener {
     /// Called on the sandbox instance runtime, preserving its OCSF/logging
     /// identity even when multiple sandboxes share one listener process.
     pub(crate) fn start(mut self, connector: Arc<BoundaryLoopbackConnector>) -> Handle {
         self.routes.serving.store(true, Ordering::Release);
         let retained_routes = self.routes.clone();
-        let task = tokio::spawn(async move {
+        let task = instance_tasks::spawn(async move {
             let routes = self.routes.clone();
             let permits = Arc::new(Semaphore::new(MAX_INSTANCE_CONNECTIONS));
             // Multiplexed requests share the previous per-instance relay budget.
             let relays = Arc::new(Semaphore::new(MAX_INSTANCE_CONNECTIONS));
-            let mut connections = JoinSet::new();
+            // Connections are spawned through the ambient instance so each one
+            // joins its task tree and carries its identity.
+            let mut connections = Connections::default();
             ocsf_emit!(
                 AppLifecycleBuilder::new(crate::ocsf_ctx())
                     .activity(ActivityId::Open)
@@ -776,59 +807,95 @@ impl InstanceListener {
                     .build()
             );
             loop {
-                tokio::select! {
-                    Some(_) = connections.join_next(), if !connections.is_empty() => {},
-                    accepted = self.receiver.recv() => {
-                        let Some(Accepted { tls, permit: host_permit }) = accepted else { break; };
-                        let Ok(instance_permit) = permits.clone().try_acquire_owned() else { continue; };
-                        let Some(sni) = tls.get_ref().1.server_name().map(str::to_ascii_lowercase) else { continue; };
-                        let prefix = routes.registration.as_ref().expect("instance registration").prefix.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                        let Some((route, token)) = routes.resolve(&sni, &prefix, &self.domain) else {
-                            emit_denial("App listener unknown or expired SNI route"); continue;
-                        };
-                        let routes = routes.clone();
-                        let connector = connector.clone();
-                        let relays = relays.clone();
-                        connections.spawn(async move {
-                            let connection_routes = routes.clone();
-                            let connection_route = route.clone();
-                            let permit = Arc::new(Permits { _host: host_permit, _instance: instance_permit, relays });
-                            let service = move |req| {
-                                proxy(req, sni.clone(), route.clone(), routes.clone(), connector.clone(), permit.clone(), token)
-                            };
-                            let connection = async {
-                                if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
-                                    let first_request = Arc::new(Notify::new());
-                                    let started = first_request.clone();
-                                    let service = hyper::service::service_fn(move |req| {
-                                        started.notify_one();
-                                        service(req)
-                                    });
-                                    let connection = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                                        .max_concurrent_streams(MAX_HTTP2_STREAMS)
-                                        .max_header_list_size(65536)
-                                        .serve_connection(TokioIo::new(tls), service);
-                                    tokio::pin!(connection);
-                                    tokio::select! {
-                                        result = &mut connection => return result,
-                                        () = first_request.notified() => {},
-                                        () = tokio::time::sleep(HANDSHAKE_TIMEOUT) => return Ok(()),
-                                    }
-                                    connection.await
-                                } else {
-                                    hyper::server::conn::http1::Builder::new()
-                                        .timer(TokioTimer::new()).header_read_timeout(HANDSHAKE_TIMEOUT)
-                                        .max_buf_size(65536).max_headers(64)
-                                        .serve_connection(TokioIo::new(tls), hyper::service::service_fn(service)).with_upgrades().await
-                                }
-                            };
+                // Reap finished connections before accepting another, so the
+                // kept handles stay bounded by the live connection permits.
+                connections.prune();
+                let Some(Accepted {
+                    tls,
+                    permit: host_permit,
+                }) = self.receiver.recv().await
+                else {
+                    break;
+                };
+                let Ok(instance_permit) = permits.clone().try_acquire_owned() else {
+                    continue;
+                };
+                let Some(sni) = tls.get_ref().1.server_name().map(str::to_ascii_lowercase) else {
+                    continue;
+                };
+                let prefix = routes
+                    .registration
+                    .as_ref()
+                    .expect("instance registration")
+                    .prefix
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let Some((route, token)) = routes.resolve(&sni, &prefix, &self.domain) else {
+                    emit_denial("App listener unknown or expired SNI route");
+                    continue;
+                };
+                let routes = routes.clone();
+                let connector = connector.clone();
+                let relays = relays.clone();
+                connections.push(instance_tasks::spawn(async move {
+                    let connection_routes = routes.clone();
+                    let connection_route = route.clone();
+                    let permit = Arc::new(Permits {
+                        _host: host_permit,
+                        _instance: instance_permit,
+                        relays,
+                    });
+                    let service = move |req| {
+                        proxy(
+                            req,
+                            sni.clone(),
+                            route.clone(),
+                            routes.clone(),
+                            connector.clone(),
+                            permit.clone(),
+                            token,
+                        )
+                    };
+                    let connection = async {
+                        if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                            let first_request = Arc::new(Notify::new());
+                            let started = first_request.clone();
+                            let service = hyper::service::service_fn(move |req| {
+                                started.notify_one();
+                                service(req)
+                            });
+                            let connection =
+                                hyper::server::conn::http2::Builder::new(InstanceExecutor)
+                                    .max_concurrent_streams(MAX_HTTP2_STREAMS)
+                                    .max_header_list_size(65536)
+                                    .serve_connection(TokioIo::new(tls), service);
+                            tokio::pin!(connection);
                             tokio::select! {
-                                _ = connection => {},
-                                () = connection_routes.revoked(&connection_route, token) => {},
+                                result = &mut connection => return result,
+                                () = first_request.notified() => {},
+                                () = tokio::time::sleep(HANDSHAKE_TIMEOUT) => return Ok(()),
                             }
-                        });
+                            connection.await
+                        } else {
+                            hyper::server::conn::http1::Builder::new()
+                                .timer(TokioTimer::new())
+                                .header_read_timeout(HANDSHAKE_TIMEOUT)
+                                .max_buf_size(65536)
+                                .max_headers(64)
+                                .serve_connection(
+                                    TokioIo::new(tls),
+                                    hyper::service::service_fn(service),
+                                )
+                                .with_upgrades()
+                                .await
+                        }
+                    };
+                    tokio::select! {
+                        _ = connection => {},
+                        () = connection_routes.revoked(&connection_route, token) => {},
                     }
-                }
+                }));
             }
         });
         Handle {
@@ -1116,7 +1183,7 @@ async fn proxy(
     if upgraded {
         let upstream = hyper::upgrade::on(&mut response);
         let downstream = downstream.expect("websocket upgrade");
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let _connection_permits = permit;
             let _relay = (active, executor);
             tokio::select! {
@@ -1147,12 +1214,36 @@ where
     fn execute(&self, future: F) {
         let mut active = self.active.clone();
         let permit = self.permit.clone();
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let _permit = permit;
             tokio::select! {
                 _ = future => {},
                 _ = active.changed() => {},
             }
+        });
+    }
+}
+
+/// Runs hyper's per-stream futures inside the ambient instance.
+///
+/// The HTTP/2 server drives each request through this executor, so the whole
+/// `proxy` service (header sanitization, bearer validation, relay permits, and
+/// the backend dial) runs in one of these tasks. Routing it through the
+/// ambient instance keeps that work tracked by the instance's task tree and
+/// scoped to its identity, and lets the tasks `proxy` starts, such as the
+/// websocket relay and the backend connection driver, join the same tree.
+/// Outside an instance the ambient spawn falls back to plain tokio, so a
+/// dedicated listener behaves as before.
+#[derive(Clone, Copy)]
+struct InstanceExecutor;
+
+impl<F> hyper::rt::Executor<F> for InstanceExecutor
+where
+    F: Future + Send + 'static,
+{
+    fn execute(&self, future: F) {
+        instance_tasks::spawn(async move {
+            future.await;
         });
     }
 }
@@ -1630,7 +1721,18 @@ mod tests {
         host: HostHandle,
     }
 
-    fn fixture() -> Fixture {
+    /// A bound app listener and its instance registration, not yet started.
+    struct Bound {
+        directory: tempfile::TempDir,
+        address: SocketAddr,
+        tls: Arc<rustls::ClientConfig>,
+        routes: Routes,
+        route: SandboxServiceRoute,
+        host: HostHandle,
+        instance: InstanceListener,
+    }
+
+    fn bound() -> Bound {
         openshell_crypto::tls::ensure_default_provider();
         let directory = tempfile::tempdir().unwrap();
         let cert = openshell_crypto::pki::generate_simple_self_signed(vec![
@@ -1669,6 +1771,27 @@ mod tests {
             backend_http_version: 0,
         };
         routes.install(&installed(vec![route.clone()]));
+        Bound {
+            directory,
+            address,
+            tls,
+            routes,
+            route,
+            host,
+            instance,
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let Bound {
+            directory,
+            address,
+            tls,
+            routes,
+            route,
+            host,
+            instance,
+        } = bound();
         let connector = Arc::new(Connector {
             calls: AtomicUsize::new(0),
         });
@@ -1685,10 +1808,383 @@ mod tests {
         }
     }
 
+    /// A connection task spawned from the app listener path is tracked by its
+    /// instance and reaped with it.
+    ///
+    /// The listener runs inside a hosted instance and the request's upstream
+    /// body stays open, so the connection task outlives the request. Removal
+    /// must close that client stream: an untracked connection task would keep
+    /// it open forever. The per-connection task is spawned through the same
+    /// ambient instance as the spawner identity tests, which pin that this
+    /// path is also attributed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instance_listener_connection_tasks_are_reaped_with_the_instance() {
+        use crate::SandboxInstanceBindings;
+        use crate::sandbox_instance_host::{
+            SandboxInstanceAdmission, SandboxInstanceAdmitted, SandboxInstanceBody,
+            SandboxInstanceHost, SandboxInstanceHostError,
+        };
+        use http_body_util::BodyExt as _;
+        use openshell_core::grpc_client::GatewayCredentials;
+        use openshell_ocsf::OcsfJsonSettings;
+        use openshell_supervisor_control::SandboxInstancePhaseReport;
+        use openshell_supervisor_network::policy_local::{
+            DenialLogSource, SandboxInstanceDenialLog,
+        };
+
+        let Bound {
+            directory: _tls_directory,
+            address,
+            tls,
+            routes: _routes,
+            route: _route,
+            host: _bound_listener,
+            instance,
+        } = bound();
+
+        let connector = Arc::new(Connector {
+            calls: AtomicUsize::new(0),
+        });
+        let body_connector = connector.clone();
+        let bindings = SandboxInstanceBindings {
+            gateway_credentials: GatewayCredentials::from_gateway_token("instance-connector")
+                .unwrap(),
+            event_context: Arc::new(crate::sandbox_instance_event_context(
+                Some("sandbox-conn"),
+                Some("sandbox-conn"),
+                String::new(),
+            )),
+            ocsf_json: OcsfJsonSettings::default(),
+            log_sink: None,
+            denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
+        };
+        let (listener_tx, listener) = tokio::sync::oneshot::channel();
+        let body: SandboxInstanceBody = Box::new(move |controls| {
+            Box::pin(async move {
+                let handle = instance.start(rpc_test::loopback(body_connector));
+                let _ = listener_tx.send(handle);
+                controls.readiness.send_replace(true);
+                controls.shutdown.await;
+                Ok(0)
+            })
+        });
+        let root = tempfile::tempdir().unwrap();
+        let host = SandboxInstanceHost::new(
+            root.path().join("instances"),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.admit(
+                SandboxInstanceAdmission {
+                    key: "sandbox-conn".into(),
+                    fingerprint: [1; 32],
+                    sandbox_id: "sandbox-conn".into(),
+                },
+                |_dir| Ok::<_, SandboxInstanceHostError>((bindings, body)),
+            )
+            .unwrap(),
+            SandboxInstanceAdmitted::Created,
+        );
+        // Hold the listener handle so only the instance's teardown ends its
+        // task tree; dropping the handle would suspend the routes first and
+        // let the connection end for the wrong reason.
+        let listener = listener.await.expect("the listener starts");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while host.status("sandbox-conn").map(|status| status.phase)
+                != Some(SandboxInstancePhaseReport::Supervising)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the instance reaches supervision");
+
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .unwrap();
+        let tls = tokio_rustls::TlsConnector::from(tls)
+            .connect(
+                rustls::pki_types::ServerName::try_from(HOST).unwrap(),
+                stream,
+            )
+            .await
+            .unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .unwrap();
+        let client_task = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/stream")
+                    .header(header::HOST, HOST)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("the proxied request is answered");
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while connector.calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connection reaches the upstream");
+
+        let removed = host
+            .remove("sandbox-conn", Duration::from_secs(10))
+            .await
+            .expect("the instance was hosted");
+        assert!(removed.phase.is_terminal(), "{removed:?}");
+        let ended = match tokio::time::timeout(
+            Duration::from_secs(5),
+            response.into_body().collect(),
+        )
+        .await
+        {
+            // A closed connection surfaces as a body error; it may also have
+            // ended with no frames if the abort landed before any were sent.
+            Ok(Err(_)) => true,
+            Ok(Ok(body)) => body.to_bytes().is_empty(),
+            Err(_) => false,
+        };
+        assert!(
+            ended,
+            "the response must end when the connection task is reaped"
+        );
+        drop(listener);
+        client_task.abort();
+    }
+
+    /// An HTTP/2 request's stream future is tracked by its instance and reaped
+    /// with it.
+    ///
+    /// The h2 server hands each request's service future to an executor, so
+    /// this drives the ALPN frontend end to end: the request is proxied and
+    /// the streaming upstream body ends when removal reaps the stream task.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instance_listener_http2_stream_tasks_are_reaped_with_the_instance() {
+        use crate::SandboxInstanceBindings;
+        use crate::sandbox_instance_host::{
+            SandboxInstanceAdmission, SandboxInstanceAdmitted, SandboxInstanceBody,
+            SandboxInstanceHost, SandboxInstanceHostError,
+        };
+        use http_body_util::BodyExt as _;
+        use openshell_core::grpc_client::GatewayCredentials;
+        use openshell_ocsf::OcsfJsonSettings;
+        use openshell_supervisor_control::SandboxInstancePhaseReport;
+        use openshell_supervisor_network::policy_local::{
+            DenialLogSource, SandboxInstanceDenialLog,
+        };
+
+        /// Counts upstream dials and answers `/stream` with a body that never
+        /// ends on its own.
+        struct StreamingConnector {
+            calls: AtomicUsize,
+        }
+
+        #[tonic::async_trait]
+        impl rpc_test::BoundaryLoopbackConnector for StreamingConnector {
+            async fn connect(
+                &self,
+                target: LoopbackTarget,
+            ) -> std::result::Result<BoundaryDuplexStream, BackendError> {
+                assert_eq!(target.port(), 8080);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let (client, server) = tokio::io::duplex(8192);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|_req: Request<Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(Response::new(Body::from_stream(
+                            futures::stream::pending::<
+                                Result<hyper::body::Bytes, std::convert::Infallible>,
+                            >(),
+                        )))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(server), service)
+                        .await;
+                });
+                Ok(Box::new(client))
+            }
+        }
+
+        let Bound {
+            directory: _tls_directory,
+            address,
+            tls,
+            routes: _routes,
+            route: _route,
+            host: _bound_listener,
+            instance,
+        } = bound();
+
+        let connector = Arc::new(StreamingConnector {
+            calls: AtomicUsize::new(0),
+        });
+        let body_connector = connector.clone();
+        let bindings = SandboxInstanceBindings {
+            gateway_credentials: GatewayCredentials::from_gateway_token("instance-connector")
+                .unwrap(),
+            event_context: Arc::new(crate::sandbox_instance_event_context(
+                Some("sandbox-conn"),
+                Some("sandbox-conn"),
+                String::new(),
+            )),
+            ocsf_json: OcsfJsonSettings::default(),
+            log_sink: None,
+            denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
+        };
+        let (listener_tx, listener) = tokio::sync::oneshot::channel();
+        let body: SandboxInstanceBody = Box::new(move |controls| {
+            Box::pin(async move {
+                let handle = instance.start(rpc_test::loopback(body_connector));
+                let _ = listener_tx.send(handle);
+                controls.readiness.send_replace(true);
+                controls.shutdown.await;
+                Ok(0)
+            })
+        });
+        let root = tempfile::tempdir().unwrap();
+        let host = SandboxInstanceHost::new(
+            root.path().join("instances"),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        assert_eq!(
+            host.admit(
+                SandboxInstanceAdmission {
+                    key: "sandbox-conn".into(),
+                    fingerprint: [1; 32],
+                    sandbox_id: "sandbox-conn".into(),
+                },
+                |_dir| Ok::<_, SandboxInstanceHostError>((bindings, body)),
+            )
+            .unwrap(),
+            SandboxInstanceAdmitted::Created,
+        );
+        // Hold the listener handle so only the instance's teardown ends its
+        // task tree.
+        let listener = listener.await.expect("the listener starts");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while host.status("sandbox-conn").map(|status| status.phase)
+                != Some(SandboxInstancePhaseReport::Supervising)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the instance reaches supervision");
+
+        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(address)
+            .await
+            .unwrap();
+        let mut config = (*tls).clone();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from(HOST).unwrap(),
+                stream,
+            )
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        let (mut sender, connection) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            TokioIo::new(tls),
+        )
+        .await
+        .unwrap();
+        let client_task = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::get(format!("https://{HOST}/stream"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("the proxied h2 request is answered");
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while connector.calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the h2 request reaches the upstream");
+
+        let removed = host
+            .remove("sandbox-conn", Duration::from_secs(10))
+            .await
+            .expect("the instance was hosted");
+        assert!(removed.phase.is_terminal(), "{removed:?}");
+        let ended = match tokio::time::timeout(
+            Duration::from_secs(5),
+            response.into_body().collect(),
+        )
+        .await
+        {
+            // A reset stream surfaces as a body error; it may also have ended
+            // with no frames if the abort landed before any were sent.
+            Ok(Err(_)) => true,
+            Ok(Ok(body)) => body.to_bytes().is_empty(),
+            Err(_) => false,
+        };
+        assert!(
+            ended,
+            "the h2 response must end when the stream task is reaped"
+        );
+        drop(listener);
+        client_task.abort();
+    }
+
+    /// hyper's h2 server runs each request through the executor, so the
+    /// executor must route that work through the ambient instance, where it
+    /// joins the instance's task tree and identity scopes. A plain tokio
+    /// executor runs it untracked and unscoped, which this pins.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_h2_executor_runs_streams_inside_the_ambient_instance() {
+        use openshell_core::instance_tasks::{
+            InstanceTaskBackend, InstanceTasks, ScopedBlockingOutput, ScopedBlockingTask,
+            ScopedTask,
+        };
+        use tokio::task::JoinHandle;
+
+        struct InlineBackend;
+
+        impl InstanceTaskBackend for InlineBackend {
+            fn spawn_scoped(&self, task: ScopedTask) -> JoinHandle<()> {
+                tokio::spawn(task)
+            }
+
+            fn spawn_scoped_blocking(
+                &self,
+                task: ScopedBlockingTask,
+            ) -> JoinHandle<Option<ScopedBlockingOutput>> {
+                tokio::task::spawn_blocking(move || Some(task()))
+            }
+        }
+
+        let instance = InstanceTasks::new(Arc::new(InlineBackend));
+        let scoped = instance
+            .scope(async {
+                let (seen_tx, seen) = tokio::sync::oneshot::channel();
+                hyper::rt::Executor::execute(&InstanceExecutor, async move {
+                    let _ = seen_tx.send(InstanceTasks::current().is_some());
+                });
+                seen.await.expect("the executed future reports")
+            })
+            .await;
+        assert!(
+            scoped,
+            "the h2 executor must run each stream inside the ambient instance"
+        );
+    }
+
     async fn request(f: &Fixture, sni: &str, host: &str, extra: &str) -> String {
         request_method(f, "GET", sni, host, extra).await
     }
-
     async fn request_method(
         f: &Fixture,
         method: &str,

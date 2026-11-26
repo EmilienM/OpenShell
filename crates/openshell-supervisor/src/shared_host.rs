@@ -163,6 +163,10 @@ pub struct SharedHostConfig {
     pub gateway_endpoint: String,
     /// Private directory for per-instance files (`--session-root`).
     pub instance_root: PathBuf,
+    /// Runtime that hosts every sandbox instance's tasks, separate from the
+    /// host's control-plane runtime. Built with
+    /// [`crate::sandbox_instance_host::instance_host_runtime`].
+    pub instance_runtime: tokio::runtime::Handle,
     /// Listener for runtime-initiated Sandbox Protocol connections.
     pub runtime_listen: SocketAddr,
     /// Time a withdrawn sandbox instance may take to stop its workload.
@@ -288,9 +292,7 @@ impl From<SandboxInstanceHostError> for ControlError {
             SandboxInstanceHostError::InvalidKey => Self::Invalid(error.to_string()),
             SandboxInstanceHostError::Conflict => Self::Conflict,
             SandboxInstanceHostError::Removing => Self::Removing,
-            SandboxInstanceHostError::Files(_) | SandboxInstanceHostError::Thread(_) => {
-                Self::Unavailable(error.to_string())
-            }
+            SandboxInstanceHostError::Files(_) => Self::Unavailable(error.to_string()),
         }
     }
 }
@@ -302,7 +304,7 @@ impl SharedHost {
             .map(crate::app_listener::Config::bind)
             .transpose()?
             .map(crate::app_listener::BoundListener::start);
-        let host = SandboxInstanceHost::new(config.instance_root)?;
+        let host = SandboxInstanceHost::new(config.instance_root, config.instance_runtime)?;
         let router = RuntimeRouter::bind(config.runtime_listen)
             .map_err(|error| miette::miette!("{error}"))?;
         Ok(Arc::new(Self {
@@ -1719,6 +1721,7 @@ mod tests {
         let host = SharedHost::start(SharedHostConfig {
             gateway_endpoint: "https://gateway.invalid".to_string(),
             instance_root: root.path().join("instances"),
+            instance_runtime: tokio::runtime::Handle::current(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
             attach_request_timeout: Duration::from_mins(5),
@@ -1763,6 +1766,7 @@ mod tests {
             let host = SharedHost::start(SharedHostConfig {
                 gateway_endpoint: "https://gateway.invalid".to_string(),
                 instance_root: root.path().join("instances"),
+                instance_runtime: tokio::runtime::Handle::current(),
                 runtime_listen: "127.0.0.1:0".parse().unwrap(),
                 removal_grace: Duration::from_secs(10),
                 attach_request_timeout: Duration::from_mins(5),
@@ -1786,6 +1790,7 @@ mod tests {
         let host = SharedHost::start(SharedHostConfig {
             gateway_endpoint: "https://gateway.invalid".to_string(),
             instance_root: root.path().join("instances"),
+            instance_runtime: tokio::runtime::Handle::current(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
             attach_request_timeout: Duration::from_mins(5),
@@ -1911,6 +1916,7 @@ mod tests {
         let host = SharedHost::start(SharedHostConfig {
             gateway_endpoint: "https://gateway.invalid".to_string(),
             instance_root: root.path().join("instances"),
+            instance_runtime: tokio::runtime::Handle::current(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
             attach_request_timeout: Duration::from_mins(5),
@@ -2011,6 +2017,7 @@ mod tests {
         let host = SharedHost::start(SharedHostConfig {
             gateway_endpoint: "https://gateway.invalid".to_string(),
             instance_root: root.path().join("instances"),
+            instance_runtime: tokio::runtime::Handle::current(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
             attach_request_timeout: Duration::from_mins(5),
@@ -2237,6 +2244,7 @@ mod tests {
         let host = SharedHost::start(SharedHostConfig {
             gateway_endpoint: "https://gateway.invalid".to_string(),
             instance_root: root.path().join("instances"),
+            instance_runtime: tokio::runtime::Handle::current(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
             attach_request_timeout: Duration::from_mins(5),
@@ -2677,6 +2685,7 @@ mod tests {
         let host = SharedHost::start(SharedHostConfig {
             gateway_endpoint: "https://gateway.invalid".to_string(),
             instance_root: root.path().join("instances"),
+            instance_runtime: tokio::runtime::Handle::current(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
             attach_request_timeout: Duration::from_mins(5),

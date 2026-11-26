@@ -13,6 +13,7 @@ use openshell_sandbox_backend::BoundaryExec;
 use std::sync::Arc;
 use std::time::Duration;
 
+use openshell_core::instance_tasks;
 use openshell_core::proto::{
     ProviderReadinessObservation, ProviderReadinessReason as Reason,
     ReportProviderReadinessResponse,
@@ -290,7 +291,7 @@ impl Tracker {
         boundary: Arc<BoundaryExec>,
     ) -> Reporter {
         let tracker = self.clone();
-        Reporter(tokio::spawn(async move {
+        Reporter(instance_tasks::spawn(async move {
             tracker
                 .run_reporter(
                     credentials,

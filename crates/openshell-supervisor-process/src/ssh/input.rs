@@ -6,6 +6,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use openshell_core::instance_tasks;
 use openshell_isolation_interface::contract::BoundaryInput;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, watch};
@@ -113,7 +114,7 @@ impl InputTask {
             consumed: 0,
             finished: false,
         };
-        let task = tokio::spawn(receiver.write_to(stdin));
+        let task = instance_tasks::spawn(receiver.write_to(stdin));
         (InputSender(shared.clone()), Self { shared, task })
     }
 

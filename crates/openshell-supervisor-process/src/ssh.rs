@@ -20,6 +20,7 @@ use crate::main_session::{MainOutput, MainSession};
 use libc;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
+use openshell_core::instance_tasks;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
@@ -205,7 +206,9 @@ pub async fn run_ssh_server(
                 let main_session = main_session.clone();
                 let server_endpoint = server_endpoint.clone();
 
-                tokio::spawn(async move {
+                // This task owns its cancellation so it can close the session
+                // before the instance's tree is reaped; see `handle_connection`.
+                instance_tasks::spawn_owning_cancellation(async move {
                     if let Err(err) = handle_connection(
                         stream,
                         config,
@@ -376,11 +379,35 @@ async fn handle_connection(
 
     let handler = SshHandler::new(port_forward, boundary_exec, main_session, server_endpoint);
     let stream = peer_stream::PeerStream::new(stream, peer_timeout);
-    russh::server::run_stream(config, stream, handler)
+    let mut session = russh::server::run_stream(config, stream, handler)
         .await
-        .map_err(|err| miette::miette!("ssh stream error: {err}"))?
-        .await
-        .map_err(|err| miette::miette!("ssh session error: {err}"))?;
+        .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
+    // russh drives the session loop in its own task, and dropping the join
+    // handle does not stop it. When the sandbox instance ends, ask the session
+    // to disconnect and wait for its loop to finish, so no handler code runs
+    // after teardown and the state it holds, including the instance's route
+    // registration, is released within the removal bound.
+    let disconnect = session.handle();
+    let cancelled = async {
+        match instance_tasks::InstanceTasks::current() {
+            Some(instance) => instance.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let result = tokio::select! {
+        result = &mut session => result,
+        () = cancelled => {
+            let _ = disconnect
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "sandbox instance ended".to_string(),
+                    "en".to_string(),
+                )
+                .await;
+            session.await
+        }
+    };
+    result.map_err(|err| miette::miette!("ssh session error: {err}"))?;
     Ok(())
 }
 
@@ -605,7 +632,7 @@ impl russh::server::Handler for SshHandler {
         let server_endpoint = self.server_endpoint.clone();
         reply.accept().await;
 
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let mut tcp_stream = match port_forward.connect(target).await {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -863,7 +890,7 @@ impl russh::server::Handler for SshHandler {
                     )
                     .await;
             }
-            let output_task = tokio::spawn(async move {
+            let output_task = instance_tasks::spawn(async move {
                 loop {
                     match output.recv().await {
                         Ok(MainOutput::Exit(code)) => {
@@ -1234,7 +1261,7 @@ impl SshHandler {
             // input here and keep backend termination off the session loop.
             state.input_task.take();
             if let Some(process) = state.process.take() {
-                tokio::spawn(async move {
+                instance_tasks::spawn(async move {
                     if let Err(error) = process.terminate().await {
                         warn!(%error, "failed to terminate rejected exec");
                     }
@@ -1266,7 +1293,7 @@ impl SshHandler {
             state.input_task.take();
             // A PTY resize can fail after spawning. Release that process too.
             if let Some(process) = state.process.take() {
-                tokio::spawn(async move {
+                instance_tasks::spawn(async move {
                     if let Err(error) = process.terminate().await {
                         warn!(%error, "failed to terminate exec after startup failure");
                     }
@@ -1278,7 +1305,7 @@ impl SshHandler {
         if let Some(output) = output {
             let diagnostic =
                 format!("openshell: cannot start command: {error}{line_ending}").into_bytes();
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 // Reserve client credit before queueing bytes. Session output
                 // would buffer stderr without credit and block closure and
                 // Handle messages for every channel on this connection.
@@ -1368,7 +1395,7 @@ impl SshHandler {
             .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
         if state.upload.is_some() && exec.stdin.is_none() {
             let process = exec.process.clone();
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 let _ = process.terminate().await;
             });
             anyhow::bail!("extraction process has no stdin");
@@ -1400,7 +1427,7 @@ impl SshHandler {
         let stdout_extended = finisher.is_some();
         let mut stdout = exec.stdout;
         let stdout_handle = handle.clone();
-        let stdout_task = tokio::spawn(async move {
+        let stdout_task = instance_tasks::spawn(async move {
             let mut buffer = [0_u8; 4096];
             loop {
                 match stdout.read(&mut buffer).await {
@@ -1418,7 +1445,7 @@ impl SshHandler {
         });
         let stderr_task = exec.stderr.map(|mut stderr| {
             let stderr_handle = handle.clone();
-            tokio::spawn(async move {
+            instance_tasks::spawn(async move {
                 let mut buffer = [0_u8; 4096];
                 loop {
                     match stderr.read(&mut buffer).await {
@@ -1432,7 +1459,7 @@ impl SshHandler {
                 }
             })
         });
-        tokio::spawn(async move {
+        instance_tasks::spawn(async move {
             let status = if let Some(output_status) = output_status {
                 // The boundary stream's final status includes output delivery
                 // failure. Process wait alone reports only the child's exit.
@@ -1627,6 +1654,7 @@ fn direct_tcpip_target(
 )]
 mod tests {
     use super::*;
+    use std::pin::Pin;
 
     #[test]
     fn ssh_events_name_their_own_server_socket_and_conform_to_ocsf() {
@@ -1766,6 +1794,125 @@ mod tests {
         ) -> Result<bool, Self::Error> {
             Ok(true)
         }
+    }
+
+    /// Ambient backend that ends its tracked tasks when cancelled, like the
+    /// instance host does, so a test can end an instance the way production
+    /// does while a connection is live.
+    struct TestInstanceBackend {
+        cancelled: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl TestInstanceBackend {
+        fn new() -> (Arc<Self>, tokio::sync::watch::Sender<bool>) {
+            let (cancelled, _) = tokio::sync::watch::channel(false);
+            let backend = Arc::new(Self {
+                cancelled: cancelled.clone(),
+            });
+            (backend, cancelled)
+        }
+    }
+
+    impl instance_tasks::InstanceTaskBackend for TestInstanceBackend {
+        fn spawn_scoped(&self, task: instance_tasks::ScopedTask) -> tokio::task::JoinHandle<()> {
+            let mut cancelled = self.cancelled.subscribe();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    () = task => {}
+                    _ = cancelled.wait_for(|value| *value) => {}
+                }
+            })
+        }
+
+        fn spawn_scoped_blocking(
+            &self,
+            task: instance_tasks::ScopedBlockingTask,
+        ) -> tokio::task::JoinHandle<Option<instance_tasks::ScopedBlockingOutput>> {
+            tokio::task::spawn_blocking(move || Some(task()))
+        }
+
+        fn spawn_owning_cancellation(
+            &self,
+            task: instance_tasks::ScopedTask,
+        ) -> tokio::task::JoinHandle<()> {
+            tokio::spawn(task)
+        }
+
+        fn cancelled(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            let mut cancelled = self.cancelled.subscribe();
+            Box::pin(async move {
+                let _ = cancelled.wait_for(|value| *value).await;
+            })
+        }
+    }
+
+    /// Cancelling a sandbox instance ends an active SSH session, so the
+    /// session's handler, which holds the instance's state, stops instead of
+    /// running after teardown.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_the_instance_ends_an_active_ssh_session() {
+        let (backend, cancel) = TestInstanceBackend::new();
+        let instance = instance_tasks::InstanceTasks::new(backend);
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("ssh.sock");
+        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server_socket = socket.clone();
+        // Spawn the server through the instance's own spawner, as the
+        // delegated access plane does.
+        instance
+            .scope(async move {
+                instance_tasks::spawn(async move {
+                    let _ = run_ssh_server(
+                        server_socket,
+                        ready_tx,
+                        None,
+                        false,
+                        rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+                        rpc_test::exec(Arc::new(RejectingExec)),
+                        None,
+                        host_key,
+                    )
+                    .await;
+                });
+            })
+            .await;
+        ready_rx
+            .await
+            .expect("the SSH server reports readiness")
+            .expect("the SSH socket binds");
+
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let mut client = russh::client::connect_stream(
+            Arc::new(russh::client::Config::default()),
+            stream,
+            AcceptAnyServerKey,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            client.authenticate_none("sandbox").await.unwrap(),
+            russh::client::AuthResult::Success
+        ));
+        // An open channel keeps a live session with handler state on the
+        // server, which is what teardown must end.
+        let _channel = client.channel_open_session().await.unwrap();
+        assert!(
+            !client.is_closed(),
+            "the session must stay open while the instance runs"
+        );
+
+        cancel.send_replace(true);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.is_closed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelling the instance must disconnect its SSH session");
     }
 
     pub(super) struct TestLoopbackConnector;

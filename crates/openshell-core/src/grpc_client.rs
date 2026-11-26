@@ -201,6 +201,11 @@ impl GatewayCredentials {
 
     /// Start the renewal task once for these credentials, on the caller's
     /// runtime, so a hosted sandbox instance's renewal stops with that instance.
+    ///
+    /// When the first connect runs inside a sandbox instance's task scope, the
+    /// ambient instance spawner tracks the renewal and keeps its events
+    /// attributed; otherwise it spawns plainly on the current runtime. Either
+    /// way [`GatewayCredentials::revoke`] aborts it through its handle.
     fn start_renewal(&self, channel: &AuthedChannel, plain_channel: &Channel, endpoint: &str) {
         let mut renewal = self
             .inner
@@ -210,7 +215,7 @@ impl GatewayCredentials {
         if !matches!(*renewal, Renewal::Idle) {
             return;
         }
-        let task = tokio::spawn(refresh_token_loop(RenewalTarget {
+        let task = crate::instance_tasks::spawn(refresh_token_loop(RenewalTarget {
             channel: channel.clone(),
             bearer: self.inner.bearer.clone(),
             #[cfg(feature = "jwt")]
@@ -1182,6 +1187,136 @@ mod auth_tests {
             delay.as_secs() < 30,
             "expected refresh before 30s expiry, got {delay:?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod instance_renewal_tests {
+    use super::*;
+    use crate::instance_tasks::{
+        InstanceTaskBackend, InstanceTasks, ScopedBlockingOutput, ScopedBlockingTask, ScopedTask,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt as _;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+
+    /// Accepts and drains connections so the client's channel stays
+    /// established while the test inspects renewal.
+    async fn accepting_gateway() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0u8; 1024];
+                    while matches!(stream.read(&mut buffer).await, Ok(read) if read > 0) {}
+                });
+            }
+        });
+        address
+    }
+
+    /// Records tasks routed to the ambient backend and flags the spawned task
+    /// dropping, which an abort of the handle stored at start causes.
+    #[derive(Default)]
+    struct RenewalProbe {
+        scoped: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl InstanceTaskBackend for RenewalProbe {
+        fn spawn_scoped(&self, task: ScopedTask) -> JoinHandle<()> {
+            self.scoped.fetch_add(1, Ordering::SeqCst);
+            let dropped = self.dropped.clone();
+            tokio::spawn(async move {
+                // Aborting the task that runs the renewal drops this guard.
+                struct NotifyOnDrop(Arc<AtomicBool>);
+                impl Drop for NotifyOnDrop {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _notify = NotifyOnDrop(dropped);
+                task.await;
+            })
+        }
+
+        fn spawn_scoped_blocking(
+            &self,
+            task: ScopedBlockingTask,
+        ) -> JoinHandle<Option<ScopedBlockingOutput>> {
+            tokio::task::spawn_blocking(move || Some(task()))
+        }
+    }
+
+    fn renewal_started(credentials: &GatewayCredentials) -> bool {
+        matches!(
+            *credentials
+                .inner
+                .renewal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Renewal::Started(_)
+        )
+    }
+
+    /// A first connect that runs inside a hosted instance spawns renewal
+    /// through that instance, so the task joins its tree and revoke's abort
+    /// reaches it. A second connect must not start another renewal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewal_spawns_through_the_ambient_instance_when_connected_inside_one() {
+        let address = accepting_gateway().await;
+        let probe = Arc::new(RenewalProbe::default());
+        let instance = InstanceTasks::new(probe.clone());
+        let credentials = GatewayCredentials::from_gateway_token("renewal-token").unwrap();
+        let gateway = GatewayEndpoint::new(address, credentials.clone());
+
+        instance
+            .clone()
+            .scope(connect_channel(&gateway))
+            .await
+            .expect("connect to the loopback gateway");
+        instance
+            .scope(connect_channel(&gateway))
+            .await
+            .expect("reconnect to the loopback gateway");
+
+        assert_eq!(
+            probe.scoped.load(Ordering::SeqCst),
+            1,
+            "renewal must be spawned once, through the ambient instance"
+        );
+        assert!(renewal_started(&credentials));
+        assert!(!probe.dropped.load(Ordering::SeqCst));
+
+        credentials.revoke();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !probe.dropped.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "revoke must abort the ambient instance's renewal task"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Outside an instance the same connect still starts renewal, on the
+    /// caller's runtime, so dedicated callers behave as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn renewal_falls_back_to_plain_tokio_outside_an_instance() {
+        assert!(InstanceTasks::current().is_none());
+        let address = accepting_gateway().await;
+        let credentials = GatewayCredentials::from_gateway_token("plain-token").unwrap();
+        let gateway = GatewayEndpoint::new(address, credentials.clone());
+
+        connect_channel(&gateway)
+            .await
+            .expect("connect to the loopback gateway");
+        assert!(renewal_started(&credentials));
+
+        credentials.revoke();
+        assert!(!renewal_started(&credentials));
     }
 }
 

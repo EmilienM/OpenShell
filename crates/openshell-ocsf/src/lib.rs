@@ -72,7 +72,7 @@ pub use builders::{
 
 // --- Tracing layers ---
 pub use tracing_layers::{
-    OCSF_TARGET, OcsfJsonSettings, OcsfJsonlLayer, OcsfShorthandLayer, bind_thread_json_settings,
-    clear_current_event, clone_current_event, emit_ocsf_event, emit_ocsf_event_routed,
-    register_event_enricher, set_current_event,
+    OCSF_TARGET, OcsfJsonSettings, OcsfJsonlLayer, OcsfShorthandLayer, clear_current_event,
+    clone_current_event, emit_ocsf_event, emit_ocsf_event_routed, register_event_enricher,
+    scope_json_settings, scope_json_settings_sync, set_current_event,
 };
